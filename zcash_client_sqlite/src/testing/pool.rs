@@ -43,6 +43,13 @@ pub(crate) fn spend_max_spendable_single_step_proposed_transfer<T: ShieldedPoolT
     >(TestDbFactory::default(), BlockCache::new())
 }
 
+pub(crate) fn create_detached_single_step_proposed_transfer<T: ShieldedPoolTester>() {
+    zcash_client_backend::data_api::testing::pool::create_detached_single_step_proposed_transfer::<T>(
+        TestDbFactory::default(),
+        BlockCache::new(),
+    )
+}
+
 pub(crate) fn spend_everything_single_step_proposed_transfer<T: ShieldedPoolTester>() {
     zcash_client_backend::data_api::testing::pool::spend_everything_single_step_proposed_transfer::<T>(
         TestDbFactory::default(),

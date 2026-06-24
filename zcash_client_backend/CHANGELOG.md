@@ -8,6 +8,13 @@ indicated by the `PLANNED` status in order to make it possible to correctly
 represent the transitive `semver` implications of changes within the enclosing
 workspace.
 
+## [0.23.0-pcash.1] - 2026-06-24
+
+### Added
+- `zcash_client_backend::data_api::wallet::create_proposed_transactions_detached`,
+  for constructing signed transactions from a proposal without storing them as
+  pending sent transactions in the wallet database.
+
 ## [0.23.0] - 2026-06-02
 
 ### Changed

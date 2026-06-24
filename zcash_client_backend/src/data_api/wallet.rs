@@ -8,7 +8,7 @@
 //! shielded internal address belonging to their wallet.
 //!
 //! The important high-level operations provided by this module are [`propose_transfer`],
-//! and [`create_proposed_transactions`].
+//! [`create_proposed_transactions`], and [`create_proposed_transactions_detached`].
 //!
 //! [`propose_transfer`] takes a [`TransactionRequest`] object, selects inputs notes and
 //! computes the fees required to satisfy that request, and returns a [`Proposal`] object that
@@ -20,6 +20,10 @@
 //! [`WalletRead::get_transaction`] method to retrieve the newly constructed transactions. It is
 //! the responsibility of the caller to retrieve and serialize the transactions and submit them for
 //! inclusion into the Zcash blockchain.
+//!
+//! [`create_proposed_transactions_detached`] constructs and returns one or more signed Zcash
+//! [`Transaction`]s without storing them as pending sent transactions in the wallet database.
+//! This is intended for sign-only workflows where another device will submit the transactions.
 //!
 #![cfg_attr(
     feature = "transparent-inputs",
@@ -905,29 +909,24 @@ impl SpendingKeys {
     }
 }
 
-/// Construct, prove, and sign a transaction or series of transactions using the inputs supplied by
-/// the given proposal, and persist it to the wallet database.
-///
-/// Returns the database identifier for each newly constructed transaction, or an error if
-/// an error occurs in transaction construction, proving, or signing.
-///
-/// When evaluating multi-step proposals, only transparent outputs of any given step may be spent
-/// in later steps; attempting to spend a shielded note (including change) output by an earlier
-/// step is not supported, because the ultimate positions of those notes in the global note
-/// commitment tree cannot be known until the transaction that produces those notes is mined,
-/// and therefore the required spend proofs for such notes cannot be constructed.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
-pub fn create_proposed_transactions<DbT, ParamsT, InputsErrT, FeeRuleT, ChangeErrT, N>(
+fn create_proposed_transaction_steps<'a, DbT, ParamsT, InputsErrT, FeeRuleT, ChangeErrT, N>(
     wallet_db: &mut DbT,
     params: &ParamsT,
     spend_prover: &impl SpendProver,
     output_prover: &impl OutputProver,
     spending_keys: &SpendingKeys,
     ovk_policy: OvkPolicy,
-    proposal: &Proposal<FeeRuleT, N>,
+    proposal: &'a Proposal<FeeRuleT, N>,
     #[cfg(feature = "unstable")] proposed_version: Option<TxVersion>,
-) -> Result<NonEmpty<TxId>, CreateErrT<DbT, InputsErrT, FeeRuleT, ChangeErrT, N>>
+) -> Result<
+    (
+        <DbT as WalletRead>::AccountId,
+        Vec<(&'a Step<N>, StepResult<<DbT as WalletRead>::AccountId>)>,
+    ),
+    CreateErrT<DbT, InputsErrT, FeeRuleT, ChangeErrT, N>,
+>
 where
     DbT: WalletWrite + WalletCommitmentTrees,
     ParamsT: consensus::Parameters + Clone,
@@ -978,6 +977,61 @@ where
         }
     }
 
+    Ok((account_id, step_results))
+}
+
+#[cfg(feature = "transparent-inputs")]
+fn requires_ephemeral_transparent_reservation<FeeRuleT, N>(
+    proposal: &Proposal<FeeRuleT, N>,
+) -> bool {
+    proposal.steps().iter().any(|step| {
+        step.balance()
+            .proposed_change()
+            .iter()
+            .any(|change| change.is_ephemeral() && change.output_pool() == PoolType::Transparent)
+    })
+}
+
+/// Construct, prove, and sign a transaction or series of transactions using the inputs supplied by
+/// the given proposal, and persist it to the wallet database.
+///
+/// Returns the database identifier for each newly constructed transaction, or an error if
+/// an error occurs in transaction construction, proving, or signing.
+///
+/// When evaluating multi-step proposals, only transparent outputs of any given step may be spent
+/// in later steps; attempting to spend a shielded note (including change) output by an earlier
+/// step is not supported, because the ultimate positions of those notes in the global note
+/// commitment tree cannot be known until the transaction that produces those notes is mined,
+/// and therefore the required spend proofs for such notes cannot be constructed.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+pub fn create_proposed_transactions<DbT, ParamsT, InputsErrT, FeeRuleT, ChangeErrT, N>(
+    wallet_db: &mut DbT,
+    params: &ParamsT,
+    spend_prover: &impl SpendProver,
+    output_prover: &impl OutputProver,
+    spending_keys: &SpendingKeys,
+    ovk_policy: OvkPolicy,
+    proposal: &Proposal<FeeRuleT, N>,
+    #[cfg(feature = "unstable")] proposed_version: Option<TxVersion>,
+) -> Result<NonEmpty<TxId>, CreateErrT<DbT, InputsErrT, FeeRuleT, ChangeErrT, N>>
+where
+    DbT: WalletWrite + WalletCommitmentTrees,
+    ParamsT: consensus::Parameters + Clone,
+    FeeRuleT: FeeRule,
+{
+    let (account_id, step_results) = create_proposed_transaction_steps(
+        wallet_db,
+        params,
+        spend_prover,
+        output_prover,
+        spending_keys,
+        ovk_policy,
+        proposal,
+        #[cfg(feature = "unstable")]
+        proposed_version,
+    )?;
+
     // TODO: This should be provided by a `Clock`
     let created = time::OffsetDateTime::now_utc();
 
@@ -1007,6 +1061,57 @@ where
         .map_err(Error::DataSource)?;
 
     Ok(NonEmpty::from_vec(txids).expect("proposal.steps is NonEmpty"))
+}
+
+/// Construct, prove, and sign a transaction or series of transactions using the inputs supplied by
+/// the given proposal, without persisting them as pending sent transactions in the wallet database.
+///
+/// Returns each newly constructed transaction, or an error if an error occurs in transaction
+/// construction, proving, or signing.
+///
+/// This function is intended for sign-only workflows. It does not call
+/// [`WalletWrite::store_transactions_to_be_sent`], so the returned transactions will not be
+/// retransmitted by the wallet and must be submitted by the caller.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+pub fn create_proposed_transactions_detached<DbT, ParamsT, InputsErrT, FeeRuleT, ChangeErrT, N>(
+    wallet_db: &mut DbT,
+    params: &ParamsT,
+    spend_prover: &impl SpendProver,
+    output_prover: &impl OutputProver,
+    spending_keys: &SpendingKeys,
+    ovk_policy: OvkPolicy,
+    proposal: &Proposal<FeeRuleT, N>,
+    #[cfg(feature = "unstable")] proposed_version: Option<TxVersion>,
+) -> Result<NonEmpty<Transaction>, CreateErrT<DbT, InputsErrT, FeeRuleT, ChangeErrT, N>>
+where
+    DbT: WalletWrite + WalletCommitmentTrees,
+    ParamsT: consensus::Parameters + Clone,
+    FeeRuleT: FeeRule,
+{
+    #[cfg(feature = "transparent-inputs")]
+    if requires_ephemeral_transparent_reservation(proposal) {
+        return Err(Error::ProposalNotSupported);
+    }
+
+    let (_, step_results) = create_proposed_transaction_steps(
+        wallet_db,
+        params,
+        spend_prover,
+        output_prover,
+        spending_keys,
+        ovk_policy,
+        proposal,
+        #[cfg(feature = "unstable")]
+        proposed_version,
+    )?;
+
+    let transactions = step_results
+        .iter()
+        .map(|(_, step_result)| step_result.build_result.transaction().clone())
+        .collect();
+
+    Ok(NonEmpty::from_vec(transactions).expect("proposal.steps is NonEmpty"))
 }
 
 #[derive(Debug, Clone)]

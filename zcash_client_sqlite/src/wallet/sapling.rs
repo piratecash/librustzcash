@@ -434,6 +434,11 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn create_detached_single_step_proposed_transfer() {
+        testing::pool::create_detached_single_step_proposed_transfer::<SaplingPoolTester>()
+    }
+
+    #[test]
     fn spend_max_spendable_single_step_proposed_transfer() {
         testing::pool::spend_max_spendable_single_step_proposed_transfer::<SaplingPoolTester>()
     }

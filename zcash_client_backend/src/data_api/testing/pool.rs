@@ -349,6 +349,68 @@ pub fn send_single_step_proposed_transfer<T: ShieldedPoolTester>(
     );
 }
 
+/// Tests detached transaction creation for a single-step proposal.
+pub fn create_detached_single_step_proposed_transfer<T: ShieldedPoolTester>(
+    dsf: impl DataStoreFactory,
+    cache: impl TestCache,
+) {
+    let mut st = TestDsl::with_sapling_birthday_account(dsf, cache).build::<T>();
+
+    st.add_a_single_note_checking_balance(Zatoshis::const_from_u64(60000));
+
+    let account = st.get_account();
+    let initial_spendable_balance =
+        st.get_spendable_balance(account.id(), ConfirmationsPolicy::MIN);
+
+    let to_extsk = T::sk(&[0xf5; 32]);
+    let to: Address = T::sk_default_address(&to_extsk);
+    let request = zip321::TransactionRequest::new(vec![Payment::without_memo(
+        to.to_zcash_address(st.network()),
+        Zatoshis::const_from_u64(10000),
+    )])
+    .unwrap();
+
+    let fee_rule = StandardFeeRule::Zip317;
+    let change_strategy = standard::SingleOutputChangeStrategy::new(
+        fee_rule,
+        Some("Detached change memo".parse::<Memo>().unwrap().into()),
+        T::SHIELDED_PROTOCOL,
+        DustOutputPolicy::default(),
+    );
+    let input_selector = GreedyInputSelector::new();
+
+    let proposal = st
+        .propose_transfer(
+            account.id(),
+            &input_selector,
+            &change_strategy,
+            request,
+            ConfirmationsPolicy::MIN,
+        )
+        .unwrap();
+
+    let transactions = st
+        .create_proposed_transactions_detached::<Infallible, _, Infallible, _>(
+            account.usk(),
+            OvkPolicy::Sender,
+            &proposal,
+        )
+        .unwrap();
+    assert_eq!(transactions.len(), 1);
+
+    let tx = transactions.first();
+    let txid = tx.txid();
+    let mut encoded = vec![];
+    tx.write(&mut encoded).unwrap();
+    assert!(!encoded.is_empty());
+
+    assert_matches!(st.wallet().get_transaction(txid), Ok(None));
+    assert_eq!(
+        st.get_spendable_balance(account.id(), ConfirmationsPolicy::MIN),
+        initial_spendable_balance
+    );
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ConfirmationStep {
     i: u32,
@@ -1105,6 +1167,14 @@ pub fn spend_everything_multi_step_single_note_proposed_transfer<T: ShieldedPool
         ]
     );
     assert_eq!(steps[1].balance().proposed_change(), []);
+
+    let create_detached_result = st
+        .create_proposed_transactions_detached::<Infallible, _, Infallible, _>(
+            account.usk(),
+            OvkPolicy::Sender,
+            &proposal,
+        );
+    assert_matches!(create_detached_result, Err(Error::ProposalNotSupported));
 
     let create_proposed_result = st.create_proposed_transactions::<Infallible, _, Infallible, _>(
         account.usk(),

@@ -57,6 +57,7 @@ use super::{
     scanning::ScanRange,
     wallet::{
         ConfirmationsPolicy, SpendingKeys, create_proposed_transactions,
+        create_proposed_transactions_detached,
         input_selection::{GreedyInputSelector, InputSelector},
         propose_send_max_transfer, propose_standard_transfer_to_address, propose_transfer,
     },
@@ -1149,6 +1150,35 @@ where
         let prover = LocalTxProver::bundled();
         let network = self.network().clone();
         create_proposed_transactions(
+            self.wallet_mut(),
+            &network,
+            &prover,
+            &prover,
+            &SpendingKeys::from_unified_spending_key(usk.clone()),
+            ovk_policy,
+            proposal,
+            #[cfg(feature = "unstable")]
+            None,
+        )
+    }
+
+    /// Invokes [`create_proposed_transactions_detached`] with the given arguments.
+    #[allow(clippy::type_complexity)]
+    pub fn create_proposed_transactions_detached<InputsErrT, FeeRuleT, ChangeErrT, N>(
+        &mut self,
+        usk: &UnifiedSpendingKey,
+        ovk_policy: OvkPolicy,
+        proposal: &Proposal<FeeRuleT, N>,
+    ) -> Result<
+        NonEmpty<Transaction>,
+        super::wallet::CreateErrT<DbT, InputsErrT, FeeRuleT, ChangeErrT, N>,
+    >
+    where
+        FeeRuleT: FeeRule,
+    {
+        let prover = LocalTxProver::bundled();
+        let network = self.network().clone();
+        create_proposed_transactions_detached(
             self.wallet_mut(),
             &network,
             &prover,
