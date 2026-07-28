@@ -15,7 +15,7 @@ use zcash_keys::{
 use zcash_note_encryption::try_output_recovery_with_ovk;
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::{
-    ShieldedProtocol,
+    ShieldedPool,
     consensus::{self, BlockHeight},
     memo::MemoBytes,
     value::Zatoshis,
@@ -27,7 +27,10 @@ use crate::{
         WalletTest,
         chain::{CommitmentTreeRoot, ScanSummary},
         testing::{TestState, pool::ShieldedPoolTester},
-        wallet::{ConfirmationsPolicy, TargetHeight},
+        wallet::{
+            ConfirmationsPolicy, TargetHeight,
+            input_selection::{LockFilter, LockedInputPolicy},
+        },
     },
     wallet::{Note, ReceivedNote},
 };
@@ -35,7 +38,7 @@ use crate::{
 /// Type for running pool-agnostic tests on the Orchard pool.
 pub struct OrchardPoolTester;
 impl ShieldedPoolTester for OrchardPoolTester {
-    const SHIELDED_PROTOCOL: ShieldedProtocol = ShieldedProtocol::Orchard;
+    const SHIELDED_PROTOCOL: ShieldedPool = ShieldedPool::Orchard;
     // const MERKLE_TREE_DEPTH: u8 = {orchard::NOTE_COMMITMENT_TREE_DEPTH as u8};
 
     type Sk = SpendingKey;
@@ -134,10 +137,11 @@ impl ShieldedPoolTester for OrchardPoolTester {
             .select_spendable_notes(
                 account,
                 target_value,
-                &[ShieldedProtocol::Orchard],
+                &[ShieldedPool::Orchard],
                 target_height,
                 confirmations_policy,
                 exclude,
+                LockFilter::Policy(&LockedInputPolicy::Exclude),
             )
             .map(|n| n.take_orchard())
     }
@@ -151,9 +155,10 @@ impl ShieldedPoolTester for OrchardPoolTester {
         st.wallet()
             .select_unspent_notes(
                 account,
-                &[ShieldedProtocol::Orchard],
+                &[ShieldedPool::Orchard],
                 target_height,
                 exclude,
+                LockFilter::Policy(&LockedInputPolicy::Exclude),
             )
             .map(|n| n.take_orchard())
     }
@@ -190,7 +195,10 @@ impl ShieldedPoolTester for OrchardPoolTester {
             if result.is_some() {
                 return result.map(|(note, addr, memo)| {
                     (
-                        Note::Orchard(note),
+                        Note::Orchard {
+                            note,
+                            pool: orchard::ValuePool::Orchard,
+                        },
                         UnifiedAddress::from_receivers(Some(addr), None, None)
                             .unwrap()
                             .into(),

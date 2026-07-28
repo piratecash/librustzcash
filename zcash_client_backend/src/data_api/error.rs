@@ -1,17 +1,21 @@
 //! Types for wallet error handling.
 
+use std::collections::HashMap;
 use std::error;
 use std::fmt::{self, Debug, Display};
+use std::hash::Hash;
 
 use shardtree::error::ShardTreeError;
 use zcash_address::ConversionError;
 use zcash_keys::address::UnifiedAddress;
 use zcash_primitives::transaction::builder;
+use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::{
     PoolType,
     value::{BalanceError, Zatoshis},
 };
 
+use crate::wallet::OutputRef;
 use crate::{
     data_api::wallet::input_selection::InputSelectorError, fees::ChangeError,
     proposal::ProposalError, wallet::NoteId,
@@ -101,9 +105,71 @@ pub enum Error<DataSourceError, CommitmentTreeError, SelectionError, FeeError, C
     #[cfg(feature = "transparent-inputs")]
     AddressNotRecognized(TransparentAddress),
 
+    /// The caller requested a nonzero target expiry height below the proposal's
+    /// minimum target height. Zero remains valid because it disables expiry.
+    ExpiryHeightBelowTargetHeight {
+        expiry_height: BlockHeight,
+        min_target_height: BlockHeight,
+    },
+
     /// An error occurred while working with PCZTs.
     #[cfg(feature = "pczt")]
     Pczt(PcztError),
+}
+
+/// Errors that may occur when rewinding the wallet to a previous chain state.
+pub enum RewindError<AccountId: Hash + Eq, E> {
+    /// An error occurred retrieving data from the underlying data source.
+    DataSource(E),
+    /// Every account in the wallet has a birthday height greater than the height to which any
+    /// reset birthday would be lowered (the chain state's block height plus one), and the
+    /// `reset_account_birthdays` argument supplied by the caller was empty. So long as at
+    /// least one account already has a birthday at or below the new birthday floor, the
+    /// rewind proceeds without lowering any birthdays even when `reset_account_birthdays` is
+    /// empty. The caller should re-try the rewind, providing a non-empty set of accounts
+    /// whose birthday metadata should be lowered to the new birthday floor.
+    ///
+    /// The reported map contains every account in the wallet along with its existing birthday
+    /// height. The caller may include any subset of these in the next call's
+    /// `reset_account_birthdays`; accounts not included will retain their existing birthday
+    /// metadata. (Rescanning of any blocks above the rewind target is performed against all
+    /// wallet viewing keys regardless of which accounts' birthday metadata is reset.)
+    RewindBeyondBirthdays(HashMap<AccountId, BlockHeight>),
+}
+
+impl<AccountId: Hash + Eq + Debug, E: Debug> Debug for RewindError<AccountId, E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RewindError::DataSource(e) => f.debug_tuple("DataSource").field(e).finish(),
+            RewindError::RewindBeyondBirthdays(birthdays) => f
+                .debug_tuple("RewindBeyondBirthdays")
+                .field(birthdays)
+                .finish(),
+        }
+    }
+}
+
+impl<AccountId: Hash + Eq + Debug, E: Display> Display for RewindError<AccountId, E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RewindError::DataSource(e) => write!(f, "Wallet data source error: {e}"),
+            RewindError::RewindBeyondBirthdays(birthdays) => write!(
+                f,
+                "Rewind would precede the birthday height of one or more accounts: {birthdays:?}"
+            ),
+        }
+    }
+}
+
+impl<AccountId: Hash + Eq + Debug, E: error::Error + 'static> error::Error
+    for RewindError<AccountId, E>
+{
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            RewindError::DataSource(e) => Some(e),
+            RewindError::RewindBeyondBirthdays(_) => None,
+        }
+    }
 }
 
 /// Errors that can occur while working with PCZTs.
@@ -249,6 +315,15 @@ where
                     "The specified transparent address was not recognized as belonging to the wallet."
                 )
             }
+            Error::ExpiryHeightBelowTargetHeight {
+                expiry_height,
+                min_target_height,
+            } => write!(
+                f,
+                "The requested expiry height {expiry_height} is below the proposal's \
+                 minimum target height {min_target_height}; the transaction would already be \
+                 expired at the earliest height at which it could be mined."
+            ),
             #[cfg(feature = "pczt")]
             Error::Pczt(e) => write!(f, "PCZT error: {e}"),
         }
@@ -477,6 +552,38 @@ impl<E: error::Error + 'static> error::Error for FindAccountForAddressError<E> {
         match self {
             FindAccountForAddressError::Backend(e) => Some(e),
             FindAccountForAddressError::UnifiedAddressConflict => None,
+        }
+    }
+}
+
+/// Errors that occur when attempting to lock an output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LockError<S> {
+    /// Wrapper for storage errors.
+    Storage(S),
+    /// The wrapped output reference was not found, or the output it refers to was already locked.
+    LockFailure(OutputRef),
+}
+
+impl<S: Display> Display for LockError<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LockError::Storage(e) => write!(f, "Note locking failed: {e}"),
+            LockError::LockFailure(output) => {
+                write!(
+                    f,
+                    "Lock conflict or missing output for reference {output:?}"
+                )
+            }
+        }
+    }
+}
+
+impl<S: error::Error + 'static> error::Error for LockError<S> {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            LockError::Storage(e) => Some(e),
+            LockError::LockFailure(_) => None,
         }
     }
 }

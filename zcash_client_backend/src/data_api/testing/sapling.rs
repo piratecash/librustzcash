@@ -9,7 +9,7 @@ use shardtree::error::ShardTreeError;
 use zcash_keys::{address::Address, keys::UnifiedSpendingKey};
 use zcash_primitives::transaction::{Transaction, components::sapling::zip212_enforcement};
 use zcash_protocol::{
-    ShieldedProtocol,
+    ShieldedPool,
     consensus::{self, BlockHeight},
     memo::MemoBytes,
     value::Zatoshis,
@@ -21,7 +21,10 @@ use crate::{
         DecryptedTransaction, InputSource, TargetValue, WalletCommitmentTrees, WalletSummary,
         WalletTest,
         chain::{CommitmentTreeRoot, ScanSummary},
-        wallet::{ConfirmationsPolicy, TargetHeight},
+        wallet::{
+            ConfirmationsPolicy, TargetHeight,
+            input_selection::{LockFilter, LockedInputPolicy},
+        },
     },
     wallet::{Note, ReceivedNote},
 };
@@ -31,7 +34,7 @@ use super::{TestState, pool::ShieldedPoolTester};
 /// Type for running pool-agnostic tests on the Sapling pool.
 pub struct SaplingPoolTester;
 impl ShieldedPoolTester for SaplingPoolTester {
-    const SHIELDED_PROTOCOL: ShieldedProtocol = ShieldedProtocol::Sapling;
+    const SHIELDED_PROTOCOL: ShieldedPool = ShieldedPool::Sapling;
     // const MERKLE_TREE_DEPTH: u8 = sapling::NOTE_COMMITMENT_TREE_DEPTH;
 
     type Sk = ExtendedSpendingKey;
@@ -118,10 +121,11 @@ impl ShieldedPoolTester for SaplingPoolTester {
             .select_spendable_notes(
                 account,
                 target_value,
-                &[ShieldedProtocol::Sapling],
+                &[ShieldedPool::Sapling],
                 target_height,
                 confirmations_policy,
                 exclude,
+                LockFilter::Policy(&LockedInputPolicy::Exclude),
             )
             .map(|n| n.take_sapling())
     }
@@ -135,9 +139,10 @@ impl ShieldedPoolTester for SaplingPoolTester {
         st.wallet()
             .select_unspent_notes(
                 account,
-                &[ShieldedProtocol::Sapling],
+                &[ShieldedPool::Sapling],
                 target_height,
                 exclude,
+                LockFilter::Policy(&LockedInputPolicy::Exclude),
             )
             .map(|n| n.take_sapling())
     }
