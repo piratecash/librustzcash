@@ -14,6 +14,7 @@ impl super::Updater {
             sapling,
             orchard,
             ironwood,
+            issue,
         } = self.pczt;
         let anchor_requirement = AnchorRequirement::for_pre_authorization(global.tx_version);
 
@@ -33,6 +34,7 @@ impl super::Updater {
                 sapling: parsed.reserialize(),
                 orchard,
                 ironwood,
+                issue,
             },
         })
     }

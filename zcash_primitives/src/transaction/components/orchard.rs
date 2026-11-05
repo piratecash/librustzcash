@@ -12,6 +12,7 @@ use orchard::{
     Action, Anchor, ValuePool,
     bundle::{Authorization, Authorized, BundleVersion, Flags},
     note::{ExtractedNoteCommitment, Nullifier, TransmittedNoteCiphertext},
+    note_encryption::OrchardDomain,
     primitives::redpallas::{self, SigType, Signature, SpendAuth, VerificationKey},
     value::ValueCommitment,
 };
@@ -163,10 +164,30 @@ pub fn bundle_version_for_branch(
             OrchardProtocolRevision::InsecureV1 => BundleVersion::orchard_insecure_v1(),
             OrchardProtocolRevision::V2 => BundleVersion::orchard_v2(),
             OrchardProtocolRevision::V3 => BundleVersion::orchard_v3(),
+            OrchardProtocolRevision::ZSA => {
+                #[cfg(feature = "zsa")]
+                {
+                    BundleVersion::orchard_zsa()
+                }
+                #[cfg(not(feature = "zsa"))]
+                {
+                    return None;
+                }
+            }
         }),
         ValuePool::Ironwood => match revision {
             OrchardProtocolRevision::InsecureV1 | OrchardProtocolRevision::V2 => None,
             OrchardProtocolRevision::V3 => Some(BundleVersion::ironwood_v3()),
+            OrchardProtocolRevision::ZSA => {
+                #[cfg(feature = "zsa")]
+                {
+                    Some(BundleVersion::ironwood_zsa())
+                }
+                #[cfg(not(feature = "zsa"))]
+                {
+                    None
+                }
+            }
         },
     }
 }
@@ -194,14 +215,16 @@ pub fn read_v5_bundle<R: Read>(
 /// slot ([`BundleVersion::ironwood_v3`]). A pre-NU6.3 version would (de)serialize the flag byte
 /// with the wrong cross-address (bit 2) semantics.
 fn check_v6_bundle_version(bundle_version: BundleVersion) -> io::Result<()> {
-    if bundle_version == BundleVersion::orchard_v3()
+    // ZSA (Nu7) uses V6 tx format with V2 orchard protocol revision.
+    if bundle_version == BundleVersion::orchard_v2()
+        || bundle_version == BundleVersion::orchard_v3()
         || bundle_version == BundleVersion::ironwood_v3()
     {
         Ok(())
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "v6 Orchard bundles require orchard_v3 or ironwood_v3",
+            "v6 Orchard bundles require orchard_v2, orchard_v3, or ironwood_v3",
         ))
     }
 }
@@ -269,18 +292,23 @@ pub fn read_cmx<R: Read>(mut reader: R) -> io::Result<ExtractedNoteCommitment> {
     })
 }
 
-pub fn read_note_ciphertext<R: Read>(mut reader: R) -> io::Result<TransmittedNoteCiphertext> {
-    let mut tnc = TransmittedNoteCiphertext {
-        epk_bytes: [0u8; 32],
-        enc_ciphertext: [0u8; 580],
-        out_ciphertext: [0u8; 80],
-    };
+pub fn read_note_ciphertext<R: Read>(
+    mut reader: R,
+) -> io::Result<TransmittedNoteCiphertext<OrchardDomain>> {
+    use zcash_note_encryption::note_bytes::NoteBytesData;
+    let mut epk_bytes = [0u8; 32];
+    let mut enc_ciphertext = NoteBytesData([0u8; 580]); // TODO: use ENC_CIPHERTEXT_SIZE constant for ZSA compat
+    let mut out_ciphertext = [0u8; 80];
 
-    reader.read_exact(&mut tnc.epk_bytes)?;
-    reader.read_exact(&mut tnc.enc_ciphertext)?;
-    reader.read_exact(&mut tnc.out_ciphertext)?;
+    reader.read_exact(&mut epk_bytes)?;
+    reader.read_exact(enc_ciphertext.as_mut())?;
+    reader.read_exact(&mut out_ciphertext)?;
 
-    Ok(tnc)
+    Ok(TransmittedNoteCiphertext {
+        epk_bytes,
+        enc_ciphertext,
+        out_ciphertext,
+    })
 }
 
 pub fn read_action_without_auth<R: Read>(mut reader: R) -> io::Result<Action<()>> {
@@ -393,10 +421,10 @@ pub fn write_cmx<W: Write>(mut writer: W, cmx: &ExtractedNoteCommitment) -> io::
 
 pub fn write_note_ciphertext<W: Write>(
     mut writer: W,
-    nc: &TransmittedNoteCiphertext,
+    nc: &TransmittedNoteCiphertext<OrchardDomain>,
 ) -> io::Result<()> {
     writer.write_all(&nc.epk_bytes)?;
-    writer.write_all(&nc.enc_ciphertext)?;
+    writer.write_all(nc.enc_ciphertext.as_ref())?;
     writer.write_all(&nc.out_ciphertext)
 }
 
@@ -420,9 +448,12 @@ pub mod testing {
         Authorized, Bundle, BundleVersion, Flags,
         testing::{self as t_orch},
     };
-    use zcash_protocol::value::{ZatBalance, testing::arb_zat_balance};
+    use zcash_protocol::{
+        consensus::BranchId,
+        value::{ZatBalance, testing::arb_zat_balance},
+    };
 
-    use crate::transaction::TxVersion;
+    use crate::transaction::{OrchardBundle, TxVersion};
 
     prop_compose! {
         pub fn arb_bundle(n_actions: usize)(
@@ -435,33 +466,43 @@ pub mod testing {
         }
     }
 
-    pub fn arb_bundle_for_version(
+    pub fn arb_bundle_for_branch(
         v: TxVersion,
-    ) -> impl Strategy<Value = Option<Bundle<Authorized, ZatBalance>>> {
-        if v.has_orchard() {
+        branch_id: BranchId,
+    ) -> impl Strategy<Value = Option<OrchardBundle<Authorized>>> {
+        if branch_id == BranchId::Nu7 {
+            // The existing arbitrary-action generator produces OrchardDomain
+            // ciphertexts. Do not mislabel those as OrchardZSADomain bundles.
+            // A domain-correct ZSA action generator can replace this empty
+            // strategy when one is available.
+            Just(()).prop_map(|()| None).boxed()
+        } else if v.has_orchard() {
             // The Orchard slot uses `orchard_v3()` in a v6 transaction (cross-address forbidden)
             // and `orchard_v2()` in a v5 transaction; the Ironwood slot is generated separately by
-            // `arb_ironwood_bundle_for_version`.
+            // `arb_ironwood_bundle_for_branch`.
             let bundle_version = orchard_bundle_version(v);
             (1usize..100)
                 .prop_flat_map(move |n| {
-                    prop::option::of(
-                        arb_bundle(n).prop_map(move |b| rebuild_with_version(b, bundle_version)),
-                    )
+                    prop::option::of(arb_bundle(n).prop_map(move |b| {
+                        OrchardBundle::OrchardVanilla(rebuild_with_version(b, bundle_version))
+                    }))
                 })
                 .boxed()
         } else {
-            Just(None).boxed()
+            Just(()).prop_map(|()| None).boxed()
         }
     }
 
-    /// Generates Ironwood bundles for the v6 transaction format. Unlike the Orchard v6 pool, the
-    /// Ironwood pool ([`BundleVersion::ironwood_v3`]) permits cross-address transfers, so this
-    /// exercises the Ironwood serialization path the Orchard generator cannot.
-    pub fn arb_ironwood_bundle_for_version(
+    /// Generates Ironwood bundles for the v6 transaction format outside NU7.
+    ///
+    /// Unlike the Orchard v6 pool, the Ironwood pool ([`BundleVersion::ironwood_v3`]) permits
+    /// cross-address transfers, so this exercises the Ironwood serialization path the Orchard
+    /// generator cannot. NU7 uses the issuance slot instead of Ironwood.
+    pub fn arb_ironwood_bundle_for_branch(
         v: TxVersion,
+        branch_id: BranchId,
     ) -> impl Strategy<Value = Option<Bundle<Authorized, ZatBalance>>> {
-        if v.has_ironwood() {
+        if v.has_ironwood() && branch_id != BranchId::Nu7 {
             (1usize..100)
                 .prop_flat_map(|n| {
                     prop::option::of(

@@ -19,6 +19,7 @@ impl super::Prover {
             sapling,
             orchard,
             ironwood,
+            issue,
         } = self.pczt;
 
         let mut parsed = sapling
@@ -40,6 +41,7 @@ impl super::Prover {
                 sapling: parsed.reserialize(),
                 orchard,
                 ironwood,
+                issue,
             },
         })
     }

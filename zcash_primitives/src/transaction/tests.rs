@@ -23,9 +23,7 @@ use crate::transaction::{
     txid::{BlockTxCommitmentDigester, hash_sapling_spends},
 };
 
-#[cfg(all(test, not(zcash_unstable = "nu7")))]
-use crate::transaction::sighash_v6::v6_signature_hash;
-#[cfg(all(test, zcash_unstable = "nu7", feature = "zip-233"))]
+#[cfg(test)]
 use crate::transaction::sighash_v6::v6_signature_hash;
 
 #[cfg(all(test, not(zcash_unstable = "nu7")))]
@@ -97,6 +95,8 @@ fn v5_auth_commitment_in_nu6_3_does_not_include_ironwood_digest() {
         BranchId::Nu6_3,
         0,
         0u32.into(),
+        #[cfg(feature = "zip-233")]
+        Zatoshis::const_from_u64(0),
         None,
         None,
         None,
@@ -125,10 +125,19 @@ fn v6_empty_auth_commitment_uses_v6_shielded_personalizations() {
     expected.update(empty_hash(b"ZTxAuthOrchaH_v6").as_bytes());
     expected.update(empty_hash(b"ZTxAuthIrnwdH_v6").as_bytes());
 
-    let tx =
-        TransactionData::from_parts_v6(BranchId::Nu6_3, 0, 0u32.into(), None, None, None, None)
-            .freeze()
-            .unwrap();
+    let tx = TransactionData::from_parts_v6(
+        BranchId::Nu6_3,
+        0,
+        0u32.into(),
+        #[cfg(feature = "zip-233")]
+        Zatoshis::const_from_u64(0),
+        None,
+        None,
+        None,
+        None,
+    )
+    .freeze()
+    .unwrap();
 
     assert_eq!(tx.auth_commitment(), expected.finalize());
 }
@@ -140,8 +149,17 @@ fn v6_empty_orchard_txid_uses_v6_orchard_personalization() {
         Params::new().hash_length(32).personal(personal).hash(&[])
     }
 
-    let tx_data =
-        TransactionData::from_parts_v6(BranchId::Nu6_3, 0, 0u32.into(), None, None, None, None);
+    let tx_data = TransactionData::from_parts_v6(
+        BranchId::Nu6_3,
+        0,
+        0u32.into(),
+        #[cfg(feature = "zip-233")]
+        Zatoshis::const_from_u64(0),
+        None,
+        None,
+        None,
+        None,
+    );
     let txid_parts = tx_data.digest(TxIdDigester);
     let tx = tx_data.freeze().unwrap();
 
@@ -163,6 +181,34 @@ fn v6_empty_orchard_txid_uses_v6_orchard_personalization() {
     assert_eq!(&tx.txid().as_ref()[..], expected.as_bytes());
 }
 
+#[cfg(all(feature = "zip-233", not(zcash_unstable = "nu7")))]
+#[test]
+fn ironwood_v6_header_omits_zip233_amount() {
+    let tx = TransactionData::from_parts_v6(
+        BranchId::Nu6_3,
+        0,
+        1u32.into(),
+        Zatoshis::const_from_u64(0x0001_0203_0405_0607),
+        None,
+        None,
+        None,
+        None,
+    )
+    .freeze()
+    .unwrap();
+
+    let mut tx_bytes = vec![];
+    tx.write(&mut tx_bytes).unwrap();
+
+    // The V6 header ends after nExpiryHeight at byte 20. The next byte is the
+    // transparent input count, not the first byte of the ZSA-only ZIP-233 amount.
+    assert_eq!(tx_bytes.len(), 26);
+    assert_eq!(&tx_bytes[20..], &[0; 6]);
+
+    let parsed = Transaction::read(&tx_bytes[..], BranchId::Nu6_3).unwrap();
+    assert_eq!(parsed.zip233_amount(), Zatoshis::ZERO);
+}
+
 #[cfg(all(test, not(zcash_unstable = "nu7")))]
 #[test]
 fn v6_branch_reconstruction_preserves_ironwood_bundle() {
@@ -174,6 +220,8 @@ fn v6_branch_reconstruction_preserves_ironwood_bundle() {
         BranchId::Nu6_3,
         0,
         1u32.into(),
+        #[cfg(feature = "zip-233")]
+        Zatoshis::const_from_u64(0),
         None,
         None,
         None,
@@ -195,10 +243,14 @@ fn v6_branch_reconstruction_preserves_ironwood_bundle() {
         tx_data.consensus_branch_id(),
         tx_data.lock_time(),
         tx_data.expiry_height(),
+        #[cfg(feature = "zip-233")]
+        Zatoshis::const_from_u64(0),
         tx_data.transparent_bundle().cloned(),
         tx_data.sprout_bundle().cloned(),
         tx_data.sapling_bundle().cloned(),
-        tx_data.orchard_bundle().cloned(),
+        tx_data
+            .orchard_bundle()
+            .and_then(|b| b.as_vanilla().cloned()),
     )
     .freeze()
     .unwrap();
@@ -209,9 +261,13 @@ fn v6_branch_reconstruction_preserves_ironwood_bundle() {
         tx_data.consensus_branch_id(),
         tx_data.lock_time(),
         tx_data.expiry_height(),
+        #[cfg(feature = "zip-233")]
+        Zatoshis::const_from_u64(0),
         tx_data.transparent_bundle().cloned(),
         tx_data.sapling_bundle().cloned(),
-        tx_data.orchard_bundle().cloned(),
+        tx_data
+            .orchard_bundle()
+            .and_then(|b| b.as_vanilla().cloned()),
         tx_data.ironwood_bundle().cloned(),
     )
     .freeze()
@@ -367,6 +423,8 @@ fn v5_tx_with_orchard_bundle(
         BranchId::Nu5,
         0,
         1u32.into(),
+        #[cfg(feature = "zip-233")]
+        Zatoshis::const_from_u64(0),
         None,
         None,
         None,
@@ -385,6 +443,8 @@ fn v5_tx_data_with_orchard_bundle(
         BranchId::Nu5,
         0,
         1u32.into(),
+        #[cfg(feature = "zip-233")]
+        Zatoshis::const_from_u64(0),
         None,
         None,
         None,
@@ -401,6 +461,8 @@ fn v5_tx_with_sapling_bundle(
         BranchId::Nu5,
         0,
         1u32.into(),
+        #[cfg(feature = "zip-233")]
+        Zatoshis::const_from_u64(0),
         None,
         None,
         Some(sapling_bundle),
@@ -419,6 +481,8 @@ fn v5_tx_data_with_sapling_bundle(
         BranchId::Nu5,
         0,
         1u32.into(),
+        #[cfg(feature = "zip-233")]
+        Zatoshis::const_from_u64(0),
         None,
         None,
         Some(sapling_bundle),
@@ -457,6 +521,8 @@ fn v6_tx_with_orchard_bundle(
         BranchId::Nu6_3,
         0,
         1u32.into(),
+        #[cfg(feature = "zip-233")]
+        Zatoshis::const_from_u64(0),
         None,
         None,
         Some(disable_cross_address(orchard_bundle)),
@@ -474,6 +540,8 @@ fn v6_tx_with_sapling_bundle(
         BranchId::Nu6_3,
         0,
         1u32.into(),
+        #[cfg(feature = "zip-233")]
+        Zatoshis::const_from_u64(0),
         None,
         Some(sapling_bundle),
         None,
@@ -491,6 +559,8 @@ fn v6_tx_data_with_sapling_bundle(
         BranchId::Nu6_3,
         0,
         1u32.into(),
+        #[cfg(feature = "zip-233")]
+        Zatoshis::const_from_u64(0),
         None,
         Some(sapling_bundle),
         None,
@@ -506,6 +576,8 @@ fn v6_tx_data_with_orchard_bundle(
         BranchId::Nu6_3,
         0,
         1u32.into(),
+        #[cfg(feature = "zip-233")]
+        Zatoshis::const_from_u64(0),
         None,
         None,
         Some(disable_cross_address(orchard_bundle)),
@@ -521,6 +593,8 @@ fn v6_tx_with_ironwood_bundle(
         BranchId::Nu6_3,
         0,
         1u32.into(),
+        #[cfg(feature = "zip-233")]
+        Zatoshis::const_from_u64(0),
         None,
         None,
         None,
@@ -538,6 +612,8 @@ fn v6_tx_data_with_ironwood_bundle(
         BranchId::Nu6_3,
         0,
         1u32.into(),
+        #[cfg(feature = "zip-233")]
+        Zatoshis::const_from_u64(0),
         None,
         None,
         None,
@@ -804,7 +880,7 @@ fn check_roundtrip(tx: Transaction) -> Result<(), TestCaseError> {
         tx.ironwood_bundle.as_ref().map(|v| *v.value_balance()),
         txo.ironwood_bundle.as_ref().map(|v| *v.value_balance())
     );
-    #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
+    #[cfg(feature = "zip-233")]
     if tx.version.has_zip233() {
         prop_assert_eq!(tx.zip233_amount, txo.zip233_amount);
     }
@@ -876,7 +952,7 @@ proptest! {
     }
 }
 
-#[cfg(all(test, zcash_unstable = "nu7"))]
+#[cfg(test)]
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(10))]
     #[test]
@@ -968,6 +1044,7 @@ impl Authorization for TestUnauthorized {
     type TransparentAuth = TestTransparentAuth;
     type SaplingAuth = sapling::bundle::Authorized;
     type OrchardAuth = orchard::bundle::Authorized;
+    type IssueAuth = orchard::issuance::Signed;
 }
 
 #[test]
@@ -1025,12 +1102,14 @@ fn zip_0244() {
             txdata.consensus_branch_id(),
             txdata.lock_time(),
             txdata.expiry_height(),
-            #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
+            #[cfg(feature = "zip-233")]
             txdata.zip233_amount,
             test_bundle,
             txdata.sprout_bundle().cloned(),
             txdata.sapling_bundle().cloned(),
-            txdata.orchard_bundle().cloned(),
+            txdata
+                .orchard_bundle()
+                .and_then(|b| b.as_vanilla().cloned()),
         );
         (tdata, txdata.digest(TxIdDigester))
     }
@@ -1121,7 +1200,7 @@ fn zip_0244() {
     }
 }
 
-#[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
+#[cfg(feature = "zip-233")]
 #[test]
 #[ignore = "The ZIP 233 test vectors were generated using the placeholder v6 version group ID \
             and must be regenerated now that `V6_VERSION_GROUP_ID` has been finalized."]
@@ -1181,7 +1260,10 @@ fn zip_0233() {
             test_bundle,
             txdata.sprout_bundle().cloned(),
             txdata.sapling_bundle().cloned(),
-            txdata.orchard_bundle().cloned(),
+            txdata
+                .orchard_bundle()
+                .and_then(|bundle| bundle.as_vanilla())
+                .cloned(),
         );
 
         (tdata, txdata.digest(TxIdDigester))

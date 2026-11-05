@@ -191,6 +191,23 @@ impl TryFrom<usize> for TxIndex {
 #[cfg(feature = "std")]
 memuse::impl_no_dynamic_usage!(TxIndex);
 
+/// The Orchard protocol variant active on a network.
+///
+/// ZSA and Ironwood are mutually exclusive protocol variants that both
+/// follow the NU6.2 era. They use different circuits, note encryption
+/// layouts, and transaction formats. A network picks one — they never
+/// co-exist on the same chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum OrchardMode {
+    /// Standard Orchard protocol (52-byte compact notes, vanilla circuit).
+    /// Used by mainnet Ironwood and standard testnet/regtest.
+    #[default]
+    Normal,
+    /// ZSA (Zcash Shielded Assets) variant: 84-byte compact notes, ZSA
+    /// circuit with asset support, issuance and burn operations.
+    Zsa,
+}
+
 /// The enumeration of known Zcash network types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NetworkType {
@@ -409,6 +426,15 @@ pub trait Parameters: Clone {
     fn is_nu_active(&self, nu: NetworkUpgrade, height: BlockHeight) -> bool {
         self.activation_height(nu).is_some_and(|h| h <= height)
     }
+
+    /// Returns the Orchard protocol variant for this network.
+    ///
+    /// Defaults to [`OrchardMode::Normal`] for backward compatibility with
+    /// all existing `Parameters` implementations. Override in
+    /// [`LocalNetwork`](crate::local_consensus::LocalNetwork) to enable ZSA.
+    fn orchard_mode(&self) -> OrchardMode {
+        OrchardMode::Normal
+    }
 }
 
 impl<P: Parameters> Parameters for &P {
@@ -500,7 +526,6 @@ impl Parameters for MainNetwork {
             NetworkUpgrade::Nu6_1 => Some(BlockHeight(3_146_400)),
             NetworkUpgrade::Nu6_2 => Some(BlockHeight(3_364_600)),
             NetworkUpgrade::Nu6_3 => Some(BlockHeight(3_428_143)),
-            #[cfg(zcash_unstable = "nu7")]
             NetworkUpgrade::Nu7 => None,
         }
     }
@@ -533,7 +558,6 @@ impl Parameters for TestNetwork {
             NetworkUpgrade::Nu6_1 => Some(BlockHeight(3_536_500)),
             NetworkUpgrade::Nu6_2 => Some(BlockHeight(4_052_000)),
             NetworkUpgrade::Nu6_3 => Some(BlockHeight(4_134_000)),
-            #[cfg(zcash_unstable = "nu7")]
             NetworkUpgrade::Nu7 => None,
         }
     }
@@ -614,7 +638,6 @@ pub enum NetworkUpgrade {
     /// The [Nu7 (proposed)] network upgrade.
     ///
     /// [Nu7 (proposed)]: https://z.cash/upgrade/nu7/
-    #[cfg(zcash_unstable = "nu7")]
     Nu7,
 }
 
@@ -634,7 +657,6 @@ impl fmt::Display for NetworkUpgrade {
             NetworkUpgrade::Nu6_1 => write!(f, "Nu6.1"),
             NetworkUpgrade::Nu6_2 => write!(f, "Nu6.2"),
             NetworkUpgrade::Nu6_3 => write!(f, "Nu6.3"),
-            #[cfg(zcash_unstable = "nu7")]
             NetworkUpgrade::Nu7 => write!(f, "Nu7"),
         }
     }
@@ -656,7 +678,6 @@ impl NetworkUpgrade {
             NetworkUpgrade::Nu6_1 => BranchId::Nu6_1,
             NetworkUpgrade::Nu6_2 => BranchId::Nu6_2,
             NetworkUpgrade::Nu6_3 => BranchId::Nu6_3,
-            #[cfg(zcash_unstable = "nu7")]
             NetworkUpgrade::Nu7 => BranchId::Nu7,
         }
     }
@@ -677,7 +698,6 @@ const UPGRADES_IN_ORDER: &[NetworkUpgrade] = &[
     NetworkUpgrade::Nu6_1,
     NetworkUpgrade::Nu6_2,
     NetworkUpgrade::Nu6_3,
-    #[cfg(zcash_unstable = "nu7")]
     NetworkUpgrade::Nu7,
 ];
 
@@ -733,7 +753,6 @@ pub enum BranchId {
     /// The consensus rules to be deployed by [`NetworkUpgrade::Nu6_3`].
     Nu6_3,
     /// The consensus rules to be deployed by [`NetworkUpgrade::Nu7`].
-    #[cfg(zcash_unstable = "nu7")]
     Nu7,
 }
 
@@ -756,8 +775,7 @@ impl TryFrom<u32> for BranchId {
             0x4dec_4df0 => Ok(BranchId::Nu6_1),
             0x5437_f330 => Ok(BranchId::Nu6_2),
             0x37a5_165b => Ok(BranchId::Nu6_3),
-            #[cfg(zcash_unstable = "nu7")]
-            0xffff_ffff => Ok(BranchId::Nu7),
+            0x7719_0ad8 => Ok(BranchId::Nu7), // ZSA
             _ => Err("Unknown consensus branch ID"),
         }
     }
@@ -777,8 +795,7 @@ impl From<BranchId> for u32 {
             BranchId::Nu6_1 => 0x4dec_4df0,
             BranchId::Nu6_2 => 0x5437_f330,
             BranchId::Nu6_3 => 0x37a5_165b,
-            #[cfg(zcash_unstable = "nu7")]
-            BranchId::Nu7 => 0xffff_ffff,
+            BranchId::Nu7 => 0x7719_0ad8, // ZSA
         }
     }
 }
@@ -816,7 +833,6 @@ impl BranchId {
             BranchId::Nu6_1 => NetworkUpgrade::Nu6_1,
             BranchId::Nu6_2 => NetworkUpgrade::Nu6_2,
             BranchId::Nu6_3 => NetworkUpgrade::Nu6_3,
-            #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => NetworkUpgrade::Nu7,
         })
     }
@@ -879,13 +895,9 @@ impl BranchId {
             BranchId::Nu6_3 => params
                 .activation_height(NetworkUpgrade::Nu6_3)
                 .map(|lower| {
-                    #[cfg(zcash_unstable = "nu7")]
                     let upper = params.activation_height(NetworkUpgrade::Nu7);
-                    #[cfg(not(zcash_unstable = "nu7"))]
-                    let upper = None;
                     (lower, upper)
                 }),
-            #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => params
                 .activation_height(NetworkUpgrade::Nu7)
                 .map(|lower| (lower, None)),
@@ -903,7 +915,6 @@ impl BranchId {
             Sprout | Overwinter | Sapling | Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1
             | Nu6_2 => true,
             BranchId::Nu6_3 => true,
-            #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => false,
         }
     }
@@ -915,7 +926,6 @@ impl BranchId {
             Sprout | Overwinter => false,
             Sapling | Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 => true,
             BranchId::Nu6_3 => true,
-            #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => true,
         }
     }
@@ -927,7 +937,6 @@ impl BranchId {
             Sprout | Overwinter | Sapling | Blossom | Heartwood | Canopy => false,
             Nu5 | Nu6 | Nu6_1 | Nu6_2 => true,
             BranchId::Nu6_3 => true,
-            #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => true,
         }
     }
@@ -942,8 +951,7 @@ impl BranchId {
             Nu5 | Nu6 | Nu6_1 => Some(OrchardProtocolRevision::InsecureV1),
             Nu6_2 => Some(OrchardProtocolRevision::V2),
             Nu6_3 => Some(OrchardProtocolRevision::V3),
-            #[cfg(zcash_unstable = "nu7")]
-            Nu7 => Some(OrchardProtocolRevision::V3),
+            Nu7 => Some(OrchardProtocolRevision::ZSA),
         }
     }
 }
@@ -969,6 +977,10 @@ pub enum OrchardProtocolRevision {
     /// prohibited for the Orchard value pool and permitted for the Ironwood value
     /// pool.
     V3,
+    /// The revision of the Orchard protocol deployed at NU7 (ZSA), which introduces
+    /// Zcash Shielded Assets. Uses the ZSA circuit; cross-address transfers are
+    /// permitted for both Orchard and Ironwood value pools.
+    ZSA,
 }
 
 #[cfg(any(test, feature = "test-dependencies"))]
@@ -991,7 +1003,6 @@ pub mod testing {
             BranchId::Nu6_1,
             BranchId::Nu6_2,
             BranchId::Nu6_3,
-            #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7,
         ])
     }
@@ -1094,10 +1105,9 @@ mod tests {
             BranchId::Nu6_3.orchard_protocol_revision(),
             Some(OrchardProtocolRevision::V3)
         );
-        #[cfg(zcash_unstable = "nu7")]
         assert_eq!(
             BranchId::Nu7.orchard_protocol_revision(),
-            Some(OrchardProtocolRevision::V3)
+            Some(OrchardProtocolRevision::ZSA)
         );
     }
 

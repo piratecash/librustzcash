@@ -123,6 +123,9 @@ use {
     zcash_protocol::{consensus::NetworkConstants, value::BalanceError},
 };
 
+#[cfg(all(feature = "pczt", feature = "zsa"))]
+use orchard::zsa::OrchardZSADomain;
+
 use zcash_primitives::transaction::TxVersion;
 
 pub mod input_selection;
@@ -2152,6 +2155,7 @@ where
                     external_ovk.map(|k| k.into()),
                     to,
                     payment_amount,
+                    orchard::note::AssetBase::zatoshi(),
                     memo.clone(),
                 )?;
                 orchard_output_meta.push((
@@ -2320,6 +2324,7 @@ where
                             internal_ovk.map(|k| k.into()),
                             change_address,
                             change_value.value(),
+                            orchard::note::AssetBase::zatoshi(),
                             memo.clone(),
                         )?;
                         orchard_output_meta.push((
@@ -2335,6 +2340,7 @@ where
                             internal_ovk.map(|k| k.into()),
                             change_address,
                             change_value.value(),
+                            orchard::note::AssetBase::zatoshi(),
                             memo.clone(),
                         )?;
                         orchard_output_meta.push((
@@ -2864,7 +2870,9 @@ where
     )?;
 
     // Build the transaction with the specified fee rule
-    let mut build_result = build_state.builder.build_for_pczt(OsRng, fee_rule)?;
+    let mut build_result = build_state
+        .builder
+        .build_for_pczt(OsRng, fee_rule, |_| false)?;
 
     if let Some(expiry_height) = expiry_height {
         build_result.pczt_parts.expiry_height = expiry_height;
@@ -2872,7 +2880,7 @@ where
 
     let created = Creator::build_from_parts(build_result.pczt_parts).ok_or(PcztError::Build)?;
 
-    let io_finalized = IoFinalizer::new(created).finalize_io()?;
+    let (io_finalized, _) = IoFinalizer::new(created).finalize_io()?;
 
     #[cfg(feature = "orchard")]
     let orchard_outputs = build_state
@@ -2957,27 +2965,25 @@ where
                     // for every spend that still requires a signature (real spends and
                     // wallet-controlled zero-value spends), so an external Signer can identify
                     // and sign it.
-                    if let Some(derivation) = account_derivation {
-                        if *needs_derivation {
-                            // All spent notes are from the same account.
-                            action_updater.set_spend_zip32_derivation(
-                                orchard::pczt::Zip32Derivation::parse(
-                                    derivation.seed_fingerprint().to_bytes(),
-                                    vec![
-                                        zip32::ChildIndex::hardened(32).index(),
-                                        zip32::ChildIndex::hardened(
-                                            params.network_type().coin_type(),
-                                        )
+                    if let Some(derivation) = account_derivation
+                        && *needs_derivation
+                    {
+                        // All spent notes are from the same account.
+                        action_updater.set_spend_zip32_derivation(
+                            orchard::pczt::Zip32Derivation::parse(
+                                derivation.seed_fingerprint().to_bytes(),
+                                vec![
+                                    zip32::ChildIndex::hardened(32).index(),
+                                    zip32::ChildIndex::hardened(params.network_type().coin_type())
                                         .index(),
-                                        zip32::ChildIndex::hardened(u32::from(
-                                            derivation.account_index(),
-                                        ))
-                                        .index(),
-                                    ],
-                                )
-                                .expect("valid"),
-                            );
-                        }
+                                    zip32::ChildIndex::hardened(u32::from(
+                                        derivation.account_index(),
+                                    ))
+                                    .index(),
+                                ],
+                            )
+                            .expect("valid"),
+                        );
                     }
 
                     if let Some((pczt_recipient, external_address)) = orchard_outputs.get(&index) {
@@ -3017,27 +3023,25 @@ where
                     // add it for every spend that still requires a signature (real spends and
                     // wallet-controlled zero-value spends), so an external Signer can identify
                     // and sign it.
-                    if let Some(derivation) = account_derivation {
-                        if *needs_derivation {
-                            // All spent notes are from the same account.
-                            action_updater.set_spend_zip32_derivation(
-                                orchard::pczt::Zip32Derivation::parse(
-                                    derivation.seed_fingerprint().to_bytes(),
-                                    vec![
-                                        zip32::ChildIndex::hardened(32).index(),
-                                        zip32::ChildIndex::hardened(
-                                            params.network_type().coin_type(),
-                                        )
+                    if let Some(derivation) = account_derivation
+                        && *needs_derivation
+                    {
+                        // All spent notes are from the same account.
+                        action_updater.set_spend_zip32_derivation(
+                            orchard::pczt::Zip32Derivation::parse(
+                                derivation.seed_fingerprint().to_bytes(),
+                                vec![
+                                    zip32::ChildIndex::hardened(32).index(),
+                                    zip32::ChildIndex::hardened(params.network_type().coin_type())
                                         .index(),
-                                        zip32::ChildIndex::hardened(u32::from(
-                                            derivation.account_index(),
-                                        ))
-                                        .index(),
-                                    ],
-                                )
-                                .expect("valid"),
-                            );
-                        }
+                                    zip32::ChildIndex::hardened(u32::from(
+                                        derivation.account_index(),
+                                    ))
+                                    .index(),
+                                ],
+                            )
+                            .expect("valid"),
+                        );
                     }
 
                     if let Some((pczt_recipient, external_address)) = ironwood_outputs.get(&index) {
@@ -3428,7 +3432,7 @@ where
     DbT::AccountId: serde::de::DeserializeOwned,
 {
     use std::collections::BTreeMap;
-    use zcash_note_encryption::{Domain, ENC_CIPHERTEXT_SIZE, ShieldedOutput};
+    use zcash_note_encryption::{Domain, ShieldedOutput};
 
     let finalized = SpendFinalizer::new(pczt).finalize_spends()?;
 
@@ -3464,12 +3468,26 @@ where
                     orchard::note::RandomSeed::from_bytes(*rseed, &rho).into_option()
                 })?;
 
+                #[cfg(feature = "zsa")]
+                let note_version = if act.output().asset().is_some() {
+                    orchard::note::NoteVersion::V3ZSA
+                } else {
+                    orchard::note::NoteVersion::V2
+                };
+                #[cfg(not(feature = "zsa"))]
+                let note_version = orchard::note::NoteVersion::V2;
+
                 orchard::Note::from_parts(
                     recipient,
                     value,
+                    act.output()
+                        .asset()
+                        .as_ref()
+                        .and_then(|asset| orchard::note::AssetBase::from_bytes(asset).into_option())
+                        .unwrap_or_else(orchard::note::AssetBase::zatoshi),
                     rho,
                     rseed,
-                    orchard::note::NoteVersion::V2,
+                    note_version,
                 )
                 .into_option()
             };
@@ -3604,7 +3622,7 @@ where
     fn to_sent_transaction_output<
         AccountId: Copy,
         D: Domain,
-        O: ShieldedOutput<D, { ENC_CIPHERTEXT_SIZE }>,
+        O: ShieldedOutput<D>,
         DbT: WalletRead + WalletCommitmentTrees,
         N,
     >(
@@ -3660,9 +3678,11 @@ where
     }
 
     #[cfg(feature = "orchard")]
-    let orchard_outputs = transaction
+    let orchard_outputs = (if let Some(bundle) = transaction
         .orchard_bundle()
-        .map(|bundle| {
+        .and_then(|bundle| bundle.as_vanilla())
+    {
+        Some({
             assert_eq!(bundle.actions().len(), orchard_output_info.len());
             bundle
                 .actions()
@@ -3691,7 +3711,48 @@ where
                 })
                 .collect::<Result<Vec<_>, _>>()
         })
-        .transpose()?;
+    } else {
+        #[cfg(feature = "zsa")]
+        {
+            transaction
+                .orchard_bundle()
+                .and_then(|bundle| bundle.as_zsa())
+                .map(|bundle| {
+                    assert_eq!(bundle.actions().len(), orchard_output_info.len());
+                    bundle
+                        .actions()
+                        .iter()
+                        .zip(orchard_output_info)
+                        .enumerate()
+                        .filter_map(|(output_index, (action, output_info))| {
+                            output_info.map(|((pczt_recipient, external_address), note)| {
+                                let domain = OrchardZSADomain::for_action(action);
+                                to_sent_transaction_output::<_, _, _, DbT, _>(
+                                    domain,
+                                    note,
+                                    action,
+                                    ShieldedPool::Orchard,
+                                    output_index,
+                                    pczt_recipient,
+                                    external_address,
+                                    |note| note.value().inner(),
+                                    |memo| memo,
+                                    |note| Note::Orchard {
+                                        note,
+                                        pool: orchard::ValuePool::Orchard,
+                                    },
+                                )
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+        }
+        #[cfg(not(feature = "zsa"))]
+        {
+            None
+        }
+    })
+    .transpose()?;
 
     let sapling_outputs = transaction
         .sapling_bundle()

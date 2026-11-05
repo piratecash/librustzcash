@@ -74,12 +74,18 @@ default = ["std"]
 std = ["document-features"]
 zip-233 = ["zcash_primitives/zip-233"]
 
+## Enables ZSA (Zcash Shielded Assets) support.
+zsa = ["zcash_primitives/zsa", "orchard"]
+
 ## Enables functionality that requires Orchard protocol types.
 orchard = [
     "dep:ff",
     "dep:nonempty",
     "dep:orchard",
     "dep:pasta_curves",
+    "dep:rand_core",
+    "rand_core/getrandom",
+    "orchard/zsa",
     "dep:zcash_note_encryption",
 ]
 
@@ -115,6 +121,7 @@ io-finalizer = [
     "dep:rand_core",
     "rand_core/getrandom",
     "dep:zcash_primitives",
+    "zcash_primitives/zsa",
     "orchard",
     "sapling",
     "transparent",
@@ -135,6 +142,7 @@ signer = [
     "dep:rand_core",
     "rand_core/getrandom",
     "dep:zcash_primitives",
+    "zcash_primitives/zsa",
     "orchard",
     "sapling",
     "transparent",
@@ -149,6 +157,7 @@ tx-extractor = [
     "dep:rand_core",
     "rand_core/getrandom",
     "dep:zcash_primitives",
+    "zcash_primitives/zsa",
     "orchard",
     "orchard/circuit",
     "sapling",
@@ -156,12 +165,16 @@ tx-extractor = [
     "transparent",
 ]
 
+
 # Undocumented internal feature flag for enabling features needed for tests.
 internal-tests = [
     "io-finalizer",
     "prover",
     "signer",
+    "spend-finalizer",
     "tx-extractor",
+    "zsa",
+    "zcash_protocol/local-consensus",
     "zcash_script/signature-validation",
 ]
 

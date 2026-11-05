@@ -18,7 +18,7 @@ use crate::orchard::bundle_version_for_revision;
 
 use zcash_protocol::consensus::BranchId;
 use zcash_protocol::constants::{
-    V5_TX_VERSION, V5_VERSION_GROUP_ID, V6_TX_VERSION, V6_VERSION_GROUP_ID,
+    V5_TX_VERSION, V5_VERSION_GROUP_ID, V6_TX_VERSION, V6_VERSION_GROUP_ID, ZSA_V6_VERSION_GROUP_ID,
 };
 
 /// Initial flags allowing any modification.
@@ -112,8 +112,7 @@ impl Creator {
             | BranchId::Nu6_1
             | BranchId::Nu6_2 => (V5_TX_VERSION, V5_VERSION_GROUP_ID),
             BranchId::Nu6_3 => (V6_TX_VERSION, V6_VERSION_GROUP_ID),
-            #[cfg(zcash_unstable = "nu7")]
-            BranchId::Nu7 => (V6_TX_VERSION, V6_VERSION_GROUP_ID),
+            BranchId::Nu7 => (V6_TX_VERSION, ZSA_V6_VERSION_GROUP_ID),
         };
 
         Ok(Self {
@@ -180,7 +179,10 @@ impl Creator {
     /// the consensus branch ID passed to [`Creator::new`] does not carry an Ironwood
     /// bundle.
     pub fn with_ironwood_anchor(mut self, ironwood_anchor: [u8; 32]) -> Result<Self, Error> {
-        if self.tx_version != V6_TX_VERSION {
+        // Ironwood anchor is only valid for the Ironwood (NU6.3) V6 transaction format,
+        // not for ZSA (NU7) which uses a different version group ID and carries an issue
+        // bundle instead.
+        if self.version_group_id != V6_VERSION_GROUP_ID {
             return Err(Error::IronwoodNotSupported);
         }
         self.ironwood_anchor = Some(ironwood_anchor);
@@ -270,6 +272,7 @@ impl Creator {
                 anchor: self.ironwood_anchor,
                 ..crate::orchard::EMPTY_IRONWOOD
             },
+            issue: Default::default(),
         })
     }
 
@@ -309,7 +312,7 @@ impl Creator {
         Some(Pczt {
             global: crate::common::Global {
                 tx_version,
-                version_group_id: parts.version.version_group_id(),
+                version_group_id: parts.version.version_group_id(parts.consensus_branch_id),
                 consensus_branch_id: parts.consensus_branch_id.into(),
                 fallback_lock_time: Some(parts.lock_time),
                 expiry_height: parts.expiry_height.into(),
@@ -327,12 +330,32 @@ impl Creator {
                 .unwrap_or(crate::sapling::EMPTY_BUNDLE),
             orchard: parts
                 .orchard
-                .map(OrchardBundle::serialize_from)
+                .map(|b| match b {
+                    zcash_primitives::transaction::builder::OrchardPcztBundle::Vanilla(bundle) => {
+                        OrchardBundle::serialize_from(bundle)
+                    }
+                    #[cfg(feature = "zsa")]
+                    zcash_primitives::transaction::builder::OrchardPcztBundle::Zsa(bundle) => {
+                        OrchardBundle::serialize_from(bundle)
+                    }
+                    #[cfg(not(feature = "zsa"))]
+                    _ => unreachable!("ZSA PCZT bundle requires the `zsa` feature"),
+                })
                 .unwrap_or(crate::orchard::EMPTY_ORCHARD),
             ironwood: parts
                 .ironwood
                 .map(OrchardBundle::serialize_from)
                 .unwrap_or(crate::orchard::EMPTY_IRONWOOD),
+            issue: {
+                let issue = crate::issue::Bundle::default();
+                #[cfg(feature = "zsa")]
+                let mut issue = issue;
+                #[cfg(feature = "zsa")]
+                if let Some(zsa) = parts.issuance_builder {
+                    issue.ik = zsa.issuance_key().to_bytes();
+                }
+                issue
+            },
         })
     }
 }

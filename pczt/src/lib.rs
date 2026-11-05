@@ -26,25 +26,26 @@ use alloc::vec::Vec;
 use getset::Getters;
 
 #[cfg(any(feature = "io-finalizer", feature = "signer", feature = "tx-extractor"))]
-use zcash_protocol::constants::{V6_TX_VERSION, V6_VERSION_GROUP_ID};
+use zcash_protocol::constants::{V6_TX_VERSION, V6_VERSION_GROUP_ID, ZSA_V6_VERSION_GROUP_ID};
 #[cfg(all(
     any(feature = "io-finalizer", feature = "signer", feature = "tx-extractor"),
-    zcash_unstable = "nu7",
     feature = "zip-233",
 ))]
 use zcash_protocol::value::Zatoshis;
 #[cfg(any(feature = "io-finalizer", feature = "signer", feature = "tx-extractor"))]
 use {
     common::{Global, determine_lock_time},
-    zcash_primitives::transaction::{Authorization, TransactionData, TxVersion},
+    zcash_primitives::transaction::{Authorization, OrchardBundle, TransactionData, TxVersion},
     zcash_protocol::{
-        consensus::{BranchId, OrchardProtocolRevision},
+        consensus::BranchId,
         constants::{V5_TX_VERSION, V5_VERSION_GROUP_ID},
     },
 };
 
 #[cfg(any(feature = "io-finalizer", feature = "signer"))]
 use zcash_primitives::transaction::sighash_v6::v6_signature_hash;
+#[cfg(all(feature = "zsa", any(feature = "io-finalizer", feature = "signer")))]
+use zcash_primitives::transaction::sighash_v6_zsa::zsa_v6_signature_hash;
 #[cfg(any(feature = "io-finalizer", feature = "signer"))]
 use {
     blake2b_simd::Hash as Blake2bHash,
@@ -56,6 +57,7 @@ use {
 pub mod roles;
 
 pub mod common;
+pub mod issue;
 pub mod orchard;
 pub mod sapling;
 pub mod transparent;
@@ -121,6 +123,10 @@ pub struct Pczt {
     pub(crate) orchard: orchard::Bundle,
     #[getset(get = "pub")]
     pub(crate) ironwood: orchard::Bundle,
+
+    /// ZSA issuance bundle data (intents and actions).
+    #[getset(get = "pub")]
+    pub(crate) issue: issue::Bundle,
 }
 
 /// Types and operations for the v1 Pczt encoding.
@@ -181,6 +187,7 @@ pub mod v1 {
                 sapling: pczt.sapling.into(),
                 orchard: pczt.orchard.into(),
                 ironwood: orchard::EMPTY_IRONWOOD,
+                issue: Default::default(),
             }
         }
     }
@@ -254,6 +261,13 @@ pub mod v2 {
         // defaulted there.
         orchard: Option<orchard::v2::Bundle>,
         ironwood: Option<orchard::v2::Bundle>,
+        /// ZSA issuance bundle data.
+        ///
+        /// This is set to `None` if the issue bundle is empty (no intents,
+        /// no actions, zero ik). Non-empty issue bundles are serialized
+        /// to preserve issuance data across PCZT role boundaries.
+        #[serde(default)]
+        issue: Option<crate::issue::Bundle>,
     }
 
     impl Pczt {
@@ -276,6 +290,10 @@ pub mod v2 {
                 sapling: sapling::v2::encode(pczt.sapling),
                 orchard: orchard::v2::encode(pczt.orchard, &orchard::EMPTY_ORCHARD)?,
                 ironwood: orchard::v2::encode(pczt.ironwood, &orchard::EMPTY_IRONWOOD)?,
+                issue: (pczt.issue.ik != [0u8; 32]
+                    || !pczt.issue.intents.is_empty()
+                    || !pczt.issue.actions.is_empty())
+                .then_some(pczt.issue),
             })
         }
     }
@@ -296,16 +314,21 @@ pub mod v2 {
                     .map(orchard::v2::Bundle::into_logical)
                     .transpose()?
                     .unwrap_or(orchard::EMPTY_IRONWOOD),
+                issue: self.issue.unwrap_or_default(),
             })
         }
     }
 
     #[cfg(test)]
     mod tests {
+        use alloc::{collections::BTreeMap, vec};
         use zcash_protocol::consensus::BranchId;
 
         use super::Pczt;
-        use crate::{orchard::NoteVersion, roles::creator::Creator};
+        use crate::{
+            orchard::{Action, EncCiphertext, NoteVersion, Output, Spend},
+            roles::creator::Creator,
+        };
 
         #[test]
         fn empty_bundles_encode_as_none_and_decode_as_empty() {
@@ -391,6 +414,67 @@ pub mod v2 {
             assert_eq!(decoded.orchard.flags, 0);
             assert_eq!(decoded.orchard.note_version, NoteVersion::V3);
         }
+
+        #[test]
+        fn zsa_assets_and_note_version_survive_round_trip() {
+            let spend_asset = [7; 32];
+            let output_asset = [9; 32];
+            let rseed_split_note = [11; 32];
+            let mut pczt = Creator::new(
+                BranchId::Nu7.into(),
+                10_000_000,
+                133,
+                Some([0; 32]),
+                Some([0; 32]),
+            )
+            .expect("NU7 is supported")
+            .build()
+            .expect("NU7 PCZT is valid");
+            pczt.orchard.actions.push(Action {
+                cv_net: Some([0; 32]),
+                spend: Spend {
+                    nullifier: [0; 32],
+                    rk: [0; 32],
+                    spend_auth_sig: None,
+                    recipient: None,
+                    value: Some(12),
+                    rho: None,
+                    rseed: None,
+                    rseed_split_note: Some(rseed_split_note),
+                    fvk: None,
+                    witness: None,
+                    alpha: None,
+                    zip32_derivation: None,
+                    dummy_sk: None,
+                    proprietary: BTreeMap::new(),
+                    asset: Some(spend_asset),
+                },
+                output: Output {
+                    cmx: Some([0; 32]),
+                    ephemeral_key: [0; 32],
+                    enc_ciphertext: EncCiphertext::Encrypted(vec![]),
+                    out_ciphertext: vec![],
+                    recipient: None,
+                    value: Some(10),
+                    rseed: None,
+                    ock: None,
+                    zip32_derivation: None,
+                    user_address: None,
+                    proprietary: BTreeMap::new(),
+                    asset: Some(output_asset),
+                },
+                rcv: None,
+            });
+
+            let encoded = Pczt::try_from(pczt).expect("ZSA PCZT encodes").serialize();
+            let decoded = crate::parse(&encoded).expect("ZSA PCZT decodes");
+            let action = &decoded.orchard.actions[0];
+
+            assert_eq!(decoded.orchard.note_version, NoteVersion::V3ZSA);
+            assert_eq!(action.spend.asset, Some(spend_asset));
+            assert_eq!(action.spend.rseed_split_note, Some(rseed_split_note));
+            assert_eq!(action.output.asset, Some(output_asset));
+        }
     }
 }
 
@@ -466,6 +550,7 @@ impl Pczt {
     /// lock time computation, and final assembly, delegating bundle extraction to the
     /// caller via closures that receive references to the parsed bundles.
     #[cfg(any(feature = "io-finalizer", feature = "signer", feature = "tx-extractor"))]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn extract_tx_data<A, E>(
         self,
         anchor_requirement: common::AnchorRequirement,
@@ -493,6 +578,29 @@ impl Pczt {
             Option<::orchard::Bundle<A::OrchardAuth, zcash_protocol::value::ZatBalance>>,
             E,
         >,
+        // Extracts the ZSA issue bundle from PCZT wire format.
+        // Only relevant for Nu7 (ZSA) transactions. Callers should return
+        // `Ok(None)` if no issuance data is present or for non-ZSA branches.
+        #[cfg(feature = "zsa")] extract_issue: impl FnOnce(
+            &crate::issue::Bundle,
+        ) -> Result<
+            Option<::orchard::issuance::IssueBundle<A::IssueAuth>>,
+            E,
+        >,
+        // Extracts the ZSA-domain orchard bundle (612-byte ciphertexts) from PCZT
+        // wire format. Only called for Nu7 (ZSA) transactions.
+        #[cfg(feature = "zsa")] extract_orchard_zsa: impl FnOnce(
+            &::orchard::pczt::Bundle<::orchard::zsa::OrchardZSADomain>,
+        ) -> Result<
+            Option<
+                ::orchard::Bundle<
+                    A::OrchardAuth,
+                    zcash_protocol::value::ZatBalance,
+                    ::orchard::zsa::OrchardZSADomain,
+                >,
+            >,
+            E,
+        >,
     ) -> Result<ParsedPczt<A>, E>
     where
         A: Authorization,
@@ -504,6 +612,8 @@ impl Pczt {
             sapling,
             orchard,
             ironwood,
+            issue,
+            ..
         } = self;
 
         let consensus_branch_id = BranchId::try_from(global.consensus_branch_id)
@@ -516,7 +626,9 @@ impl Pczt {
 
         let version = match (global.tx_version, global.version_group_id) {
             (V5_TX_VERSION, V5_VERSION_GROUP_ID) => Ok(TxVersion::V5),
-            (V6_TX_VERSION, V6_VERSION_GROUP_ID) => Ok(TxVersion::V6),
+            (V6_TX_VERSION, V6_VERSION_GROUP_ID) | (V6_TX_VERSION, ZSA_V6_VERSION_GROUP_ID) => {
+                Ok(TxVersion::V6)
+            }
             (version, version_group_id) => Err(ExtractError::UnsupportedTxVersion {
                 version,
                 version_group_id,
@@ -530,10 +642,10 @@ impl Pczt {
                     return Err(ExtractError::IronwoodNotSupported.into());
                 }
             }
-            // The v6 transaction format does not exist prior to NU6.3 (the first
-            // upgrade under which the Orchard protocol is at revision V3).
+            // The v6 transaction format is only valid under NU6.3 (Ironwood) and
+            // NU7 (ZSA). Reject it under any other consensus branch.
             TxVersion::V6 => {
-                if orchard_protocol_revision < OrchardProtocolRevision::V3 {
+                if !TxVersion::V6.valid_in_branch(consensus_branch_id) {
                     return Err(ExtractError::UnsupportedConsensusBranchId.into());
                 }
             }
@@ -550,9 +662,31 @@ impl Pczt {
             ::orchard::ValuePool::Orchard,
         )
         .expect("the Orchard pool is supported under every protocol revision");
-        let orchard = orchard
-            .into_parsed_with_version(orchard_bundle_version, anchor_requirement)
-            .map_err(ExtractError::OrchardParse)?;
+        // Parse with the domain-appropriate method. For Nu7 the builder produces
+        // 612-byte ZSA ciphertexts; parse with OrchardZSADomain so the sighash
+        // commitment uses ZSA indices matching the ZSA prover circuit.
+        let orchard = {
+            #[cfg(feature = "zsa")]
+            if consensus_branch_id == BranchId::Nu7 {
+                PcztOrchardBundle::Zsa(
+                    orchard
+                        .into_parsed_with_version_zsa(orchard_bundle_version, anchor_requirement)
+                        .map_err(ExtractError::OrchardParse)?,
+                )
+            } else {
+                PcztOrchardBundle::Vanilla(
+                    orchard
+                        .into_parsed_with_version(orchard_bundle_version, anchor_requirement)
+                        .map_err(ExtractError::OrchardParse)?,
+                )
+            }
+            #[cfg(not(feature = "zsa"))]
+            PcztOrchardBundle::Vanilla(
+                orchard
+                    .into_parsed_with_version(orchard_bundle_version, anchor_requirement)
+                    .map_err(ExtractError::OrchardParse)?,
+            )
+        };
         let ironwood = ironwood
             .into_ironwood_parsed(anchor_requirement)
             .map_err(ExtractError::IronwoodParse)?;
@@ -562,19 +696,50 @@ impl Pczt {
 
         let transparent_bundle = extract_transparent(&transparent)?;
         let sapling_bundle = extract_sapling(&sapling.bundle)?;
-        let orchard_bundle = extract_orchard(&orchard.bundle)?;
+        let orchard_bundle = match &orchard {
+            PcztOrchardBundle::Vanilla(parsed) => {
+                extract_orchard(&parsed.bundle)?.map(OrchardBundle::OrchardVanilla)
+            }
+            #[cfg(feature = "zsa")]
+            PcztOrchardBundle::Zsa(parsed) => {
+                extract_orchard_zsa(&parsed.bundle)?.map(OrchardBundle::OrchardZSA)
+            }
+        };
         let ironwood_bundle = extract_ironwood(&ironwood.bundle)?;
+        #[cfg(feature = "zsa")]
+        let issue_bundle = extract_issue(&issue)?;
 
         let tx_data = match version {
+            // ZSA (Nu7) uses a different V6 layout: issue bundle instead of ironwood.
+            #[cfg(feature = "zsa")]
+            TxVersion::V6 if consensus_branch_id == BranchId::Nu7 => {
+                TransactionData::from_parts_zsa(
+                    consensus_branch_id,
+                    lock_time,
+                    global.expiry_height.into(),
+                    #[cfg(feature = "zip-233")]
+                    Zatoshis::ZERO,
+                    transparent_bundle,
+                    sapling_bundle,
+                    orchard_bundle,
+                    issue_bundle,
+                )
+            }
             TxVersion::V6 => TransactionData::from_parts_v6(
                 consensus_branch_id,
                 lock_time,
                 global.expiry_height.into(),
-                #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
+                #[cfg(feature = "zip-233")]
                 Zatoshis::ZERO,
                 transparent_bundle,
                 sapling_bundle,
-                orchard_bundle,
+                orchard_bundle.map(|b| match b {
+                    OrchardBundle::OrchardVanilla(b) => b,
+                    #[cfg(feature = "zsa")]
+                    OrchardBundle::OrchardZSA(_) => panic!("ZSA in non-Nu7 V6"),
+                    #[cfg(not(feature = "zsa"))]
+                    _ => panic!("ZSA bundle requires the `zsa` feature"),
+                }),
                 ironwood_bundle,
             ),
             _ => TransactionData::from_parts(
@@ -582,12 +747,18 @@ impl Pczt {
                 consensus_branch_id,
                 lock_time,
                 global.expiry_height.into(),
-                #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
+                #[cfg(feature = "zip-233")]
                 Zatoshis::ZERO,
                 transparent_bundle,
                 None,
                 sapling_bundle,
-                orchard_bundle,
+                orchard_bundle.map(|b| match b {
+                    OrchardBundle::OrchardVanilla(b) => b,
+                    #[cfg(feature = "zsa")]
+                    OrchardBundle::OrchardZSA(_) => panic!("ZSA in pre-V6 tx"),
+                    #[cfg(not(feature = "zsa"))]
+                    _ => panic!("ZSA bundle requires the `zsa` feature"),
+                }),
             ),
         };
 
@@ -597,6 +768,7 @@ impl Pczt {
             sapling,
             orchard,
             ironwood,
+            issue,
             tx_data,
         })
     }
@@ -616,9 +788,26 @@ impl Pczt {
             |s| s.extract_effects().map_err(ExtractError::SaplingExtract),
             |o| o.extract_effects().map_err(ExtractError::OrchardExtract),
             |i| i.extract_effects().map_err(ExtractError::IronwoodExtract),
+            #[cfg(feature = "zsa")]
+            |issue| Ok(issue.to_effects()),
+            #[cfg(feature = "zsa")]
+            |o| o.extract_effects().map_err(ExtractError::OrchardExtract),
         )
         .map(|parsed| parsed.tx_data)
     }
+}
+
+/// The result of parsing a PCZT and constructing its `TransactionData`.
+#[cfg(any(feature = "io-finalizer", feature = "signer", feature = "tx-extractor"))]
+#[cfg_attr(
+    not(any(feature = "io-finalizer", feature = "signer")),
+    allow(dead_code)
+)]
+/// The parsed Orchard-pool PCZT bundle, domain-specific.
+pub(crate) enum PcztOrchardBundle {
+    Vanilla(crate::orchard::Parsed),
+    #[cfg(feature = "zsa")]
+    Zsa(crate::orchard::Parsed<::orchard::zsa::OrchardZSADomain>),
 }
 
 /// The result of parsing a PCZT and constructing its `TransactionData`.
@@ -631,8 +820,9 @@ pub(crate) struct ParsedPczt<A: Authorization> {
     pub(crate) global: Global,
     pub(crate) transparent: ::transparent::pczt::Bundle,
     pub(crate) sapling: crate::sapling::Parsed,
-    pub(crate) orchard: crate::orchard::Parsed,
+    pub(crate) orchard: PcztOrchardBundle,
     pub(crate) ironwood: crate::orchard::Parsed,
+    pub(crate) issue: crate::issue::Bundle,
     pub(crate) tx_data: TransactionData<A>,
 }
 
@@ -644,6 +834,7 @@ impl Authorization for EffectsOnly {
     type TransparentAuth = ::transparent::bundle::EffectsOnly;
     type SaplingAuth = ::sapling::bundle::EffectsOnly;
     type OrchardAuth = ::orchard::bundle::EffectsOnly;
+    type IssueAuth = ::orchard::issuance::EffectsOnly;
 }
 
 /// Helper to produce the correct sighash for a PCZT.
@@ -655,7 +846,16 @@ pub(crate) fn sighash(
 ) -> [u8; 32] {
     match tx_data.version() {
         TxVersion::V5 => v5_signature_hash(tx_data, signable_input, txid_parts),
-        TxVersion::V6 => v6_signature_hash(tx_data, signable_input, txid_parts),
+        TxVersion::V6 => {
+            #[cfg(feature = "zsa")]
+            if tx_data.consensus_branch_id() == BranchId::Nu7 {
+                zsa_v6_signature_hash(tx_data, signable_input, txid_parts)
+            } else {
+                v6_signature_hash(tx_data, signable_input, txid_parts)
+            }
+            #[cfg(not(feature = "zsa"))]
+            v6_signature_hash(tx_data, signable_input, txid_parts)
+        }
         _ => unreachable!("PCZT only supports v5 and v6 transaction data"),
     }
     .as_ref()

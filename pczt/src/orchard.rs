@@ -152,13 +152,13 @@ impl fmt::Display for MemoPlaintextError {
 /// change the anchor, even though parsing may have substituted a placeholder for it
 /// (see [ZIP 374: Anchors and pre-authorization](https://zips.z.cash/zip-0374#anchors-and-pre-authorization)).
 #[cfg(feature = "orchard")]
-pub(crate) struct Parsed {
-    pub(crate) bundle: orchard::pczt::Bundle,
+pub(crate) struct Parsed<D: Domain = orchard::note_encryption::OrchardDomain> {
+    pub(crate) bundle: orchard::pczt::Bundle<D>,
     pub(crate) wire_anchor: Option<[u8; 32]>,
 }
 
 #[cfg(feature = "orchard")]
-impl Parsed {
+impl<D: Domain> Parsed<D> {
     /// Serializes the parsed bundle back into its wire representation, using
     /// [`Self::wire_anchor`] as the result's `anchor` in place of any placeholder
     /// substituted while parsing.
@@ -222,12 +222,14 @@ pub(crate) mod testing {
                 value: None,
                 rho: None,
                 rseed: None,
+                rseed_split_note: None,
                 fvk: None,
                 witness: None,
                 alpha: None,
                 zip32_derivation: None,
                 dummy_sk: None,
                 proprietary: BTreeMap::new(),
+                asset: None,
             },
             output: Output {
                 cmx: Some([4; 32]),
@@ -241,6 +243,7 @@ pub(crate) mod testing {
                 zip32_derivation: None,
                 user_address: None,
                 proprietary: BTreeMap::new(),
+                asset: None,
             },
             rcv: None,
         }
@@ -345,28 +348,47 @@ fn recover_memo_plaintext_from_ciphertext_and_action(
         note_encryption::{CompactAction, IronwoodDomain, OrchardDomain},
         value::NoteValue,
     };
-    use zcash_note_encryption::{COMPACT_NOTE_SIZE, try_output_recovery_with_pkd_esk};
+    use zcash_note_encryption::{
+        COMPACT_NOTE_SIZE, note_bytes::NoteBytesData, try_output_recovery_with_pkd_esk,
+    };
 
     struct OutputRecoveryData {
-        cmx: [u8; 32],
+        cmx: ExtractedNoteCommitment,
         ephemeral_key: [u8; 32],
-        enc_ciphertext: [u8; ENC_CIPHERTEXT_SIZE],
+        enc_ciphertext: NoteBytesData<ENC_CIPHERTEXT_SIZE>,
     }
 
-    impl<D> ShieldedOutput<D, ENC_CIPHERTEXT_SIZE> for OutputRecoveryData
+    impl<D> ShieldedOutput<D> for OutputRecoveryData
     where
-        D: Domain<ExtractedCommitmentBytes = [u8; 32]>,
+        D: Domain<
+                ExtractedCommitment = ExtractedNoteCommitment,
+                ExtractedCommitmentBytes = [u8; 32],
+                NoteCiphertextBytes = NoteBytesData<ENC_CIPHERTEXT_SIZE>,
+                CompactNoteCiphertextBytes = NoteBytesData<COMPACT_NOTE_SIZE>,
+            >,
     {
         fn ephemeral_key(&self) -> EphemeralKeyBytes {
             EphemeralKeyBytes(self.ephemeral_key)
         }
 
-        fn cmstar_bytes(&self) -> [u8; 32] {
-            self.cmx
+        fn cmstar(&self) -> &ExtractedNoteCommitment {
+            &self.cmx
         }
 
-        fn enc_ciphertext(&self) -> &[u8; ENC_CIPHERTEXT_SIZE] {
-            &self.enc_ciphertext
+        fn cmstar_bytes(&self) -> [u8; 32] {
+            self.cmx.to_bytes()
+        }
+
+        fn enc_ciphertext(&self) -> Option<&NoteBytesData<ENC_CIPHERTEXT_SIZE>> {
+            Some(&self.enc_ciphertext)
+        }
+
+        fn enc_ciphertext_compact(&self) -> NoteBytesData<COMPACT_NOTE_SIZE> {
+            NoteBytesData(
+                self.enc_ciphertext.0[..COMPACT_NOTE_SIZE]
+                    .try_into()
+                    .unwrap(),
+            )
         }
     }
 
@@ -376,7 +398,14 @@ fn recover_memo_plaintext_from_ciphertext_and_action(
         output: &OutputRecoveryData,
     ) -> Option<MemoPlaintext>
     where
-        D: Domain<Note = Note, Memo = [u8; MEMO_SIZE], ExtractedCommitmentBytes = [u8; 32]>,
+        D: Domain<
+                Note = Note,
+                Memo = [u8; MEMO_SIZE],
+                ExtractedCommitment = ExtractedNoteCommitment,
+                ExtractedCommitmentBytes = [u8; 32],
+                NoteCiphertextBytes = NoteBytesData<ENC_CIPHERTEXT_SIZE>,
+                CompactNoteCiphertextBytes = NoteBytesData<COMPACT_NOTE_SIZE>,
+            >,
     {
         let pk_d = D::get_pk_d(note);
         let esk = D::derive_esk(note)?;
@@ -395,9 +424,16 @@ fn recover_memo_plaintext_from_ciphertext_and_action(
     ))?;
     let rho = Option::from(Rho::from_bytes(&action.spend.nullifier))?;
     let rseed = Option::from(RandomSeed::from_bytes(*action.output.rseed.as_ref()?, &rho))?;
+    let asset = action
+        .output
+        .asset
+        .as_ref()
+        .and_then(|asset| Option::from(::orchard::note::AssetBase::from_bytes(asset)))
+        .unwrap_or_else(::orchard::note::AssetBase::zatoshi);
     let note = Option::from(Note::from_parts(
         recipient,
         NoteValue::from_raw(action.output.value?),
+        asset,
         rho,
         rseed,
         note_version,
@@ -409,15 +445,17 @@ fn recover_memo_plaintext_from_ciphertext_and_action(
     let cmx_bytes = action.output.cmx?;
     let cmx = Option::from(ExtractedNoteCommitment::from_bytes(&cmx_bytes))?;
     let output = OutputRecoveryData {
-        cmx: cmx_bytes,
+        cmx,
         ephemeral_key: action.output.ephemeral_key,
-        enc_ciphertext,
+        enc_ciphertext: NoteBytesData(enc_ciphertext),
     };
     let compact_action = CompactAction::from_parts(
         nullifier,
         cmx,
         EphemeralKeyBytes(action.output.ephemeral_key),
-        output.enc_ciphertext[..COMPACT_NOTE_SIZE].try_into().ok()?,
+        output.enc_ciphertext.0[..COMPACT_NOTE_SIZE]
+            .try_into()
+            .ok()?,
     );
 
     match note_version {
@@ -431,6 +469,10 @@ fn recover_memo_plaintext_from_ciphertext_and_action(
             &note,
             &output,
         ),
+        #[cfg(feature = "zsa")]
+        NoteVersion::V3ZSA => None,
+        #[cfg(not(feature = "zsa"))]
+        _ => None,
     }
 }
 
@@ -507,6 +549,7 @@ pub struct Action {
     ///
     /// This opens `cv` for all participants. For Signers who don't need this information,
     /// or after proofs / signatures have been applied, this can be redacted.
+    #[getset(get = "pub")]
     pub(crate) rcv: Option<[u8; 32]>,
 }
 
@@ -546,6 +589,7 @@ pub struct Spend {
     ///
     /// This exposes the input value to all participants. For Signers who don't need this
     /// information, or after signatures have been applied, this can be redacted.
+    #[getset(get = "pub")]
     pub(crate) value: Option<u64>,
 
     /// The rho value for the note being spent.
@@ -559,6 +603,11 @@ pub struct Spend {
     /// - This is set by the Constructor.
     /// - This is required by the Prover.
     pub(crate) rseed: Option<[u8; 32]>,
+
+    /// The alternate seed used to derive the nullifier of a ZSA split note.
+    ///
+    /// Presence of this field marks this as a split spend.
+    pub(crate) rseed_split_note: Option<[u8; 32]>,
 
     /// The full viewing key that received the note being spent.
     ///
@@ -596,6 +645,13 @@ pub struct Spend {
     /// Proprietary fields related to the note being spent.
     #[getset(get = "pub")]
     pub(crate) proprietary: BTreeMap<String, Vec<u8>>,
+
+    /// The asset base of the note being spent. Required for NU7 actions,
+    /// including native ZEC; older Orchard actions may omit it.
+    ///
+    /// Required by Verifiers/Provers to reconstruct the ZSA note commitment.
+    #[getset(get = "pub")]
+    pub(crate) asset: Option<[u8; 32]>,
 }
 
 /// Information about the output part of an Orchard action.
@@ -669,6 +725,13 @@ pub struct Output {
     /// Proprietary fields related to the note being created.
     #[getset(get = "pub")]
     pub(crate) proprietary: BTreeMap<String, Vec<u8>>,
+
+    /// The asset base of the output note. Required for NU7 actions,
+    /// including native ZEC; older Orchard actions may omit it.
+    ///
+    /// Required by Provers to reconstruct the ZSA note commitment.
+    #[getset(get = "pub")]
+    pub(crate) asset: Option<[u8; 32]>,
 }
 
 /// Types for the v1 Orchard PCZT encoding.
@@ -717,6 +780,7 @@ pub mod v1 {
         value: Option<u64>,
         rho: Option<[u8; 32]>,
         rseed: Option<[u8; 32]>,
+        rseed_split_note: Option<[u8; 32]>,
         #[serde_as(as = "Option<[_; 96]>")]
         fvk: Option<[u8; 96]>,
         witness: Option<(u32, [[u8; 32]; 32])>,
@@ -724,6 +788,7 @@ pub mod v1 {
         zip32_derivation: Option<Zip32Derivation>,
         dummy_sk: Option<[u8; 32]>,
         proprietary: BTreeMap<String, Vec<u8>>,
+        asset: Option<[u8; 32]>,
     }
 
     /// Information about the output part of an Orchard action.
@@ -742,6 +807,7 @@ pub mod v1 {
         zip32_derivation: Option<Zip32Derivation>,
         user_address: Option<String>,
         proprietary: BTreeMap<String, Vec<u8>>,
+        asset: Option<[u8; 32]>,
     }
 
     impl TryFrom<super::Bundle> for Bundle {
@@ -837,12 +903,14 @@ pub mod v1 {
                 value: spend.value,
                 rho: spend.rho,
                 rseed: spend.rseed,
+                rseed_split_note: spend.rseed_split_note,
                 fvk: spend.fvk,
                 witness: spend.witness,
                 alpha: spend.alpha,
                 zip32_derivation: spend.zip32_derivation,
                 dummy_sk: spend.dummy_sk,
                 proprietary: spend.proprietary,
+                asset: spend.asset,
             }
         }
     }
@@ -857,12 +925,14 @@ pub mod v1 {
                 value: spend.value,
                 rho: spend.rho,
                 rseed: spend.rseed,
+                rseed_split_note: spend.rseed_split_note,
                 fvk: spend.fvk,
                 witness: spend.witness,
                 alpha: spend.alpha,
                 zip32_derivation: spend.zip32_derivation,
                 dummy_sk: spend.dummy_sk,
                 proprietary: spend.proprietary,
+                asset: spend.asset,
             }
         }
     }
@@ -888,6 +958,7 @@ pub mod v1 {
                 zip32_derivation: output.zip32_derivation,
                 user_address: output.user_address,
                 proprietary: output.proprietary,
+                asset: output.asset,
             })
         }
     }
@@ -906,6 +977,7 @@ pub mod v1 {
                 zip32_derivation: output.zip32_derivation,
                 user_address: output.user_address,
                 proprietary: output.proprietary,
+                asset: output.asset,
             }
         }
     }
@@ -926,6 +998,8 @@ pub(crate) mod v2 {
     enum SerializedNoteVersion {
         V2,
         V3,
+        #[cfg(feature = "orchard")]
+        V3Zsa,
     }
 
     impl From<NoteVersion> for SerializedNoteVersion {
@@ -933,6 +1007,8 @@ pub(crate) mod v2 {
             match note_version {
                 NoteVersion::V2 => Self::V2,
                 NoteVersion::V3 => Self::V3,
+                #[cfg(feature = "orchard")]
+                NoteVersion::V3ZSA => Self::V3Zsa,
             }
         }
     }
@@ -942,6 +1018,8 @@ pub(crate) mod v2 {
             match note_version {
                 SerializedNoteVersion::V2 => Self::V2,
                 SerializedNoteVersion::V3 => Self::V3,
+                #[cfg(feature = "orchard")]
+                SerializedNoteVersion::V3Zsa => Self::V3ZSA,
             }
         }
     }
@@ -982,6 +1060,7 @@ pub(crate) mod v2 {
         value: Option<u64>,
         rho: Option<[u8; 32]>,
         rseed: Option<[u8; 32]>,
+        rseed_split_note: Option<[u8; 32]>,
         #[serde_as(as = "Option<[_; 96]>")]
         fvk: Option<[u8; 96]>,
         witness: Option<(u32, [[u8; 32]; 32])>,
@@ -989,6 +1068,7 @@ pub(crate) mod v2 {
         zip32_derivation: Option<crate::common::Zip32Derivation>,
         dummy_sk: Option<[u8; 32]>,
         proprietary: BTreeMap<String, Vec<u8>>,
+        asset: Option<[u8; 32]>,
     }
 
     /// Information about the output part of an Orchard action.
@@ -1007,6 +1087,7 @@ pub(crate) mod v2 {
         zip32_derivation: Option<crate::common::Zip32Derivation>,
         user_address: Option<String>,
         proprietary: BTreeMap<String, Vec<u8>>,
+        asset: Option<[u8; 32]>,
     }
 
     impl TryFrom<super::Bundle> for Bundle {
@@ -1079,12 +1160,14 @@ pub(crate) mod v2 {
                 value: spend.value,
                 rho: spend.rho,
                 rseed: spend.rseed,
+                rseed_split_note: spend.rseed_split_note,
                 fvk: spend.fvk,
                 witness: spend.witness,
                 alpha: spend.alpha,
                 zip32_derivation: spend.zip32_derivation,
                 dummy_sk: spend.dummy_sk,
                 proprietary: spend.proprietary,
+                asset: spend.asset,
             }
         }
     }
@@ -1105,12 +1188,14 @@ pub(crate) mod v2 {
                 value: self.value,
                 rho: self.rho,
                 rseed: self.rseed,
+                rseed_split_note: self.rseed_split_note,
                 fvk: self.fvk,
                 witness: self.witness,
                 alpha: self.alpha,
                 zip32_derivation: self.zip32_derivation,
                 dummy_sk: self.dummy_sk,
                 proprietary: self.proprietary,
+                asset: self.asset,
             })
         }
     }
@@ -1129,6 +1214,7 @@ pub(crate) mod v2 {
                 zip32_derivation: output.zip32_derivation,
                 user_address: output.user_address,
                 proprietary: output.proprietary,
+                asset: output.asset,
             }
         }
     }
@@ -1147,6 +1233,7 @@ pub(crate) mod v2 {
                 zip32_derivation: output.zip32_derivation,
                 user_address: output.user_address,
                 proprietary: output.proprietary,
+                asset: output.asset,
             }
         }
     }
@@ -1198,12 +1285,14 @@ pub(crate) mod v2 {
                     value: None,
                     rho: None,
                     rseed: None,
+                    rseed_split_note: None,
                     fvk: None,
                     witness: None,
                     alpha: None,
                     zip32_derivation: None,
                     dummy_sk: None,
                     proprietary: BTreeMap::new(),
+                    asset: None,
                 },
                 output: Output {
                     cmx,
@@ -1217,6 +1306,7 @@ pub(crate) mod v2 {
                     zip32_derivation: None,
                     user_address: None,
                     proprietary: BTreeMap::new(),
+                    asset: None,
                 },
                 rcv: None,
             }
@@ -1325,6 +1415,7 @@ pub(crate) mod v2 {
             let note = Option::from(Note::from_parts(
                 recipient,
                 value,
+                ::orchard::note::AssetBase::zatoshi(),
                 rho,
                 rseed,
                 NoteVersion::V2,
@@ -1343,18 +1434,20 @@ pub(crate) mod v2 {
                     value: None,
                     rho: None,
                     rseed: None,
+                    rseed_split_note: None,
                     fvk: None,
                     witness: None,
                     alpha: None,
                     zip32_derivation: None,
                     dummy_sk: None,
                     proprietary: BTreeMap::new(),
+                    asset: None,
                 },
                 output: Output {
                     cmx: Some(ExtractedNoteCommitment::from(note.commitment()).to_bytes()),
                     ephemeral_key: OrchardDomain::epk_bytes(encryptor.epk()).0,
                     enc_ciphertext: EncCiphertext::Encrypted(
-                        encryptor.encrypt_note_plaintext().to_vec(),
+                        encryptor.encrypt_note_plaintext().as_ref().to_vec(),
                     ),
                     out_ciphertext: Vec::new(),
                     recipient: Some(recipient.to_raw_address_bytes()),
@@ -1364,6 +1457,7 @@ pub(crate) mod v2 {
                     zip32_derivation: None,
                     user_address: None,
                     proprietary: BTreeMap::new(),
+                    asset: None,
                 },
                 rcv: None,
             }
@@ -1679,12 +1773,14 @@ impl Bundle {
                         value,
                         rho,
                         rseed,
+                        rseed_split_note,
                         fvk,
                         witness,
                         alpha,
                         zip32_derivation: spend_zip32_derivation,
                         dummy_sk,
                         proprietary: spend_proprietary,
+                        asset: spend_asset,
                     },
                 output:
                     Output {
@@ -1699,6 +1795,7 @@ impl Bundle {
                         zip32_derivation: output_zip32_derivation,
                         user_address,
                         proprietary: output_proprietary,
+                        asset: output_asset,
                     },
                 rcv,
             } = rhs;
@@ -1718,12 +1815,14 @@ impl Bundle {
                 && merge_optional(&mut lhs.spend.value, value)
                 && merge_optional(&mut lhs.spend.rho, rho)
                 && merge_optional(&mut lhs.spend.rseed, rseed)
+                && merge_optional(&mut lhs.spend.rseed_split_note, rseed_split_note)
                 && merge_optional(&mut lhs.spend.fvk, fvk)
                 && merge_optional(&mut lhs.spend.witness, witness)
                 && merge_optional(&mut lhs.spend.alpha, alpha)
                 && merge_optional(&mut lhs.spend.zip32_derivation, spend_zip32_derivation)
                 && merge_optional(&mut lhs.spend.dummy_sk, dummy_sk)
                 && merge_map(&mut lhs.spend.proprietary, spend_proprietary)
+                && merge_optional(&mut lhs.spend.asset, spend_asset)
                 && merge_optional(&mut lhs.output.cmx, cmx)
                 && merge_optional(&mut lhs.output.recipient, output_recipient)
                 && merge_optional(&mut lhs.output.value, output_value)
@@ -1732,6 +1831,7 @@ impl Bundle {
                 && merge_optional(&mut lhs.output.zip32_derivation, output_zip32_derivation)
                 && merge_optional(&mut lhs.output.user_address, user_address)
                 && merge_map(&mut lhs.output.proprietary, output_proprietary)
+                && merge_optional(&mut lhs.output.asset, output_asset)
                 && merge_optional(&mut lhs.rcv, rcv))
             {
                 return None;
@@ -1758,10 +1858,12 @@ pub(crate) fn bundle_version_for_revision(
             OrchardProtocolRevision::InsecureV1 => BundleVersion::orchard_insecure_v1(),
             OrchardProtocolRevision::V2 => BundleVersion::orchard_v2(),
             OrchardProtocolRevision::V3 => BundleVersion::orchard_v3(),
+            OrchardProtocolRevision::ZSA => BundleVersion::orchard_zsa(),
         }),
         ValuePool::Ironwood => match revision {
             OrchardProtocolRevision::InsecureV1 | OrchardProtocolRevision::V2 => None,
             OrchardProtocolRevision::V3 => Some(BundleVersion::ironwood_v3()),
+            OrchardProtocolRevision::ZSA => Some(BundleVersion::ironwood_zsa()),
         },
     }
 }
@@ -1822,8 +1924,8 @@ pub enum AnchorConsistencyError {
 ///
 /// [ZIP 374]: https://zips.z.cash/zip-0374#anchors-and-pre-authorization
 #[cfg(all(feature = "orchard", feature = "prover"))]
-pub(crate) fn verify_witnesses_root_to_anchor(
-    bundle: &orchard::pczt::Bundle,
+pub(crate) fn verify_witnesses_root_to_anchor<D: zcash_note_encryption::Domain>(
+    bundle: &orchard::pczt::Bundle<D>,
     anchor: orchard::Anchor,
 ) -> Result<(), AnchorConsistencyError> {
     for action in bundle.actions() {
@@ -1849,9 +1951,13 @@ pub(crate) fn verify_witnesses_root_to_anchor(
             .rseed()
             .ok_or(AnchorConsistencyError::IncompleteSpendData)?;
 
-        let note = orchard::Note::from_parts(recipient, *value, rho, rseed, *spend.note_version())
-            .into_option()
-            .ok_or(AnchorConsistencyError::IncompleteSpendData)?;
+        let asset = spend
+            .asset()
+            .unwrap_or_else(orchard::note::AssetBase::zatoshi);
+        let note =
+            orchard::Note::from_parts(recipient, *value, asset, rho, rseed, *spend.note_version())
+                .into_option()
+                .ok_or(AnchorConsistencyError::IncompleteSpendData)?;
         let cmx = orchard::note::ExtractedNoteCommitment::from(note.commitment());
         let computed_anchor = witness.root(cmx);
 
@@ -1907,6 +2013,10 @@ impl Output {
                 self.value
                     .ok_or(ParseError::InvalidExtractedNoteCommitment)?,
             ),
+            self.asset
+                .as_ref()
+                .and_then(|asset| Option::from(::orchard::note::AssetBase::from_bytes(asset)))
+                .unwrap_or_else(::orchard::note::AssetBase::zatoshi),
             rho,
             rseed,
             note_version,
@@ -1965,6 +2075,10 @@ impl Output {
         let note = Note::from_parts(
             recipient,
             NoteValue::from_raw(self.value.ok_or(ParseError::InvalidEncCiphertext)?),
+            self.asset
+                .as_ref()
+                .and_then(|asset| Option::from(::orchard::note::AssetBase::from_bytes(asset)))
+                .unwrap_or_else(::orchard::note::AssetBase::zatoshi),
             rho,
             rseed,
             note_version,
@@ -1973,7 +2087,7 @@ impl Output {
         .ok_or(ParseError::InvalidEncCiphertext)?;
         let encryptor = OrchardNoteEncryption::new(None, note, memo);
         let ephemeral_key = OrchardDomain::epk_bytes(encryptor.epk()).0;
-        let enc_ciphertext = encryptor.encrypt_note_plaintext().to_vec();
+        let enc_ciphertext = encryptor.encrypt_note_plaintext().as_ref().to_vec();
 
         if ephemeral_key != self.ephemeral_key {
             return Err(ParseError::InvalidEncCiphertext);
@@ -2076,7 +2190,25 @@ impl Bundle {
         bundle_version: BundleVersion,
         anchor_requirement: crate::common::AnchorRequirement,
     ) -> Result<Parsed, ParseError> {
-        self.into_parsed_inner(bundle_version, anchor_requirement, false)
+        self.into_parsed_inner::<orchard::note_encryption::OrchardDomain>(
+            bundle_version,
+            anchor_requirement,
+            false,
+        )
+    }
+
+    /// Parses this bundle using the ZSA note-encryption domain.
+    #[cfg(feature = "zsa")]
+    pub(crate) fn into_parsed_with_version_zsa(
+        self,
+        bundle_version: BundleVersion,
+        anchor_requirement: crate::common::AnchorRequirement,
+    ) -> Result<Parsed<orchard::zsa::OrchardZSADomain>, ParseError> {
+        self.into_parsed_inner::<orchard::zsa::OrchardZSADomain>(
+            bundle_version,
+            anchor_requirement,
+            false,
+        )
     }
 
     /// Parses this bundle with the given bundle version for a preverified signing
@@ -2098,18 +2230,22 @@ impl Bundle {
         bundle_version: BundleVersion,
         anchor_requirement: crate::common::AnchorRequirement,
     ) -> Result<Parsed, ParseError> {
-        self.into_parsed_inner(bundle_version, anchor_requirement, true)
+        self.into_parsed_inner::<orchard::note_encryption::OrchardDomain>(
+            bundle_version,
+            anchor_requirement,
+            true,
+        )
     }
 
     /// The shared body of [`Bundle::into_parsed_with_version`] and
     /// [`Bundle::into_parsed_with_version_preverified_for_signing`]: `preverified`
     /// selects between the full parse and the preverified signing parse.
-    fn into_parsed_inner(
+    fn into_parsed_inner<D: zcash_note_encryption::Domain>(
         mut self,
         bundle_version: BundleVersion,
         anchor_requirement: crate::common::AnchorRequirement,
         preverified: bool,
-    ) -> Result<Parsed, ParseError> {
+    ) -> Result<Parsed<D>, ParseError> {
         self.resolve_fields()?;
         let wire_anchor = self.anchor;
         let anchor = anchor_requirement
@@ -2122,11 +2258,11 @@ impl Bundle {
         // This can overflow stacks of embedded signers for high action count
         // transactions.
         #[inline(never)]
-        fn parse_action_inner(
-            mut action: Action,
+        fn parse_action_inner<D: zcash_note_encryption::Domain>(
+            action: Action,
             note_version: NoteVersion,
             preverified: bool,
-        ) -> Result<orchard::pczt::Action, orchard::pczt::ParseError> {
+        ) -> Result<orchard::pczt::Action<D>, orchard::pczt::ParseError> {
             let spend_zip32_derivation = action
                 .spend
                 .zip32_derivation
@@ -2134,47 +2270,29 @@ impl Bundle {
                     orchard::pczt::Zip32Derivation::parse(z.seed_fingerprint, z.derivation_path)
                 })
                 .transpose()?;
-            let spend_nullifier = action.spend.nullifier;
-
-            let spend = if preverified {
-                orchard::pczt::Spend::parse_preverified_for_signing(
-                    action.spend.nullifier,
-                    action.spend.rk,
-                    action.spend.spend_auth_sig,
-                    action.spend.recipient,
-                    action.spend.value,
-                    action.spend.rho,
-                    action.spend.rseed,
-                    action.spend.fvk,
-                    action.spend.witness,
-                    action.spend.alpha,
-                    spend_zip32_derivation,
-                    action.spend.dummy_sk,
-                    note_version,
-                    action.spend.proprietary,
-                )
+            let parse_spend = if preverified {
+                orchard::pczt::Spend::parse_preverified_for_signing
             } else {
-                orchard::pczt::Spend::parse(
-                    action.spend.nullifier,
-                    action.spend.rk,
-                    action.spend.spend_auth_sig,
-                    action.spend.recipient,
-                    action.spend.value,
-                    action.spend.rho,
-                    action.spend.rseed,
-                    action.spend.fvk,
-                    action.spend.witness,
-                    action.spend.alpha,
-                    spend_zip32_derivation,
-                    action.spend.dummy_sk,
-                    note_version,
-                    action.spend.proprietary,
-                )
-            }?;
-
-            action
-                .output
-                .encrypt_ciphertext_from_memo(note_version, spend_nullifier)?;
+                orchard::pczt::Spend::parse
+            };
+            let spend = parse_spend(
+                action.spend.nullifier,
+                action.spend.rk,
+                action.spend.spend_auth_sig,
+                action.spend.recipient,
+                action.spend.value,
+                action.spend.rho,
+                action.spend.rseed,
+                action.spend.rseed_split_note,
+                action.spend.fvk,
+                action.spend.witness,
+                action.spend.alpha,
+                spend_zip32_derivation,
+                action.spend.dummy_sk,
+                note_version,
+                action.spend.proprietary,
+                action.spend.asset,
+            )?;
 
             let enc_ciphertext = action
                 .output
@@ -2185,7 +2303,7 @@ impl Bundle {
                 .cv_net
                 .ok_or(orchard::pczt::ParseError::InvalidValueCommitment)?;
 
-            let output = orchard::pczt::Output::parse(
+            let output = orchard::pczt::Output::<D>::parse(
                 *spend.nullifier(),
                 action
                     .output
@@ -2208,18 +2326,19 @@ impl Bundle {
                 action.output.user_address,
                 note_version,
                 action.output.proprietary,
+                action.output.asset,
             )?;
 
-            orchard::pczt::Action::parse(cv_net, spend, output, action.rcv)
+            orchard::pczt::Action::<D>::parse(cv_net, spend, output, action.rcv)
         }
 
         let note_version = self.note_version;
         let mut actions = Vec::with_capacity(self.actions.len());
         for action in self.actions {
-            actions.push(parse_action_inner(action, note_version, preverified)?);
+            actions.push(parse_action_inner::<D>(action, note_version, preverified)?);
         }
 
-        let bundle = orchard::pczt::Bundle::parse(
+        let bundle = orchard::pczt::Bundle::<D>::parse(
             actions,
             self.flags,
             bundle_version,
@@ -2235,8 +2354,9 @@ impl Bundle {
         })
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn serialize_from(bundle: orchard::pczt::Bundle) -> Self {
+    pub(crate) fn serialize_from<D: zcash_note_encryption::Domain>(
+        bundle: orchard::pczt::Bundle<D>,
+    ) -> Self {
         let note_version = bundle.bundle_version().note_version();
 
         assert!(
@@ -2297,12 +2417,14 @@ impl Bundle {
                             .dummy_sk()
                             .map(|dummy_sk| *dummy_sk.to_bytes()),
                         proprietary: spend.proprietary().clone(),
+                        asset: spend.asset().map(|a| a.to_bytes()),
+                        rseed_split_note: spend.rseed_split_note().map(|rseed| *rseed.as_bytes()),
                     },
                     output: Output {
                         cmx: Some(output.cmx().to_bytes()),
                         ephemeral_key: output.encrypted_note().epk_bytes,
                         enc_ciphertext: EncCiphertext::Encrypted(
-                            output.encrypted_note().enc_ciphertext.to_vec(),
+                            output.encrypted_note().enc_ciphertext.as_ref().to_vec(),
                         ),
                         out_ciphertext: output.encrypted_note().out_ciphertext.to_vec(),
                         recipient: action
@@ -2324,6 +2446,7 @@ impl Bundle {
                         }),
                         user_address: output.user_address().clone(),
                         proprietary: output.proprietary().clone(),
+                        asset: output.asset().map(|a| a.to_bytes()),
                     },
                     rcv: action.rcv().as_ref().map(|rcv| rcv.to_bytes()),
                 }

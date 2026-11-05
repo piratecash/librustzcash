@@ -7,15 +7,17 @@ pub(super) fn verify_bundle(
     orchard_vk: Option<&VerifyingKey>,
     sighash: [u8; 32],
 ) -> Result<(), OrchardError> {
+    let is_zsa = bundle.bundle_version().is_zsa();
     match orchard_vk {
-        Some(vk) => verify_bundle_with_key(bundle, vk, sighash),
-        // The circuit version is fixed by the bundle's own `BundleVersion`, which
-        // `extract_tx_data` derives from the PCZT's consensus branch ID.
-        None => verify_bundle_with_key(
-            bundle,
-            &VerifyingKey::build(bundle.bundle_version().circuit_version()),
-            sighash,
-        ),
+        Some(vk) => verify_bundle_with_key(bundle, vk, sighash, is_zsa),
+        None => {
+            let vk = if is_zsa {
+                VerifyingKey::build_zsa()
+            } else {
+                VerifyingKey::build(bundle.bundle_version().circuit_version())
+            };
+            verify_bundle_with_key(bundle, &vk, sighash, is_zsa)
+        }
     }
 }
 
@@ -23,11 +25,20 @@ fn verify_bundle_with_key(
     bundle: &Bundle<Authorized, ZatBalance>,
     vk: &VerifyingKey,
     sighash: [u8; 32],
+    is_zsa: bool,
 ) -> Result<(), OrchardError> {
     let mut validator = orchard::bundle::BatchValidator::new(vk);
-    validator
-        .add_bundle(bundle, sighash)
-        .map_err(|_| OrchardError::InvalidProof)?;
+    if is_zsa {
+        #[cfg(feature = "zsa")]
+        let enable_zsa = bundle.flags().zsa_enabled();
+        #[cfg(not(feature = "zsa"))]
+        let enable_zsa = false;
+        validator.add_bundle_zsa(bundle, sighash, enable_zsa);
+    } else {
+        validator
+            .add_bundle(bundle, sighash)
+            .map_err(|_| OrchardError::InvalidProof)?;
+    }
 
     if validator.validate(OsRng) {
         Ok(())

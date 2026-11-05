@@ -1696,8 +1696,8 @@ impl TestBuilder<(), ()> {
         nu6_1: None,
         nu6_2: None,
         nu6_3: None,
-        #[cfg(zcash_unstable = "nu7")]
         nu7: None,
+        orchard_mode: zcash_protocol::consensus::OrchardMode::Normal,
     };
 
     /// Constructs a new test environment builder.
@@ -2555,7 +2555,7 @@ fn compact_sapling_output<P: consensus::Parameters, R: RngCore + CryptoRng>(
         CompactSaplingOutput {
             cmu,
             ephemeral_key,
-            ciphertext: enc_ciphertext[..52].to_vec(),
+            ciphertext: enc_ciphertext.as_ref()[..52].to_vec(),
         },
         note,
     )
@@ -2587,15 +2587,16 @@ fn compact_orchard_action<R: RngCore + CryptoRng>(
             nullifier: compact_action.nullifier().to_bytes().to_vec(),
             cmx: compact_action.cmx().to_bytes().to_vec(),
             ephemeral_key:
-                ShieldedOutput::<::orchard::note_encryption::OrchardDomain, 52>::ephemeral_key(
+                ShieldedOutput::<::orchard::note_encryption::OrchardDomain>::ephemeral_key(
                     &compact_action,
                 )
                 .0
                 .to_vec(),
             ciphertext:
-                ShieldedOutput::<::orchard::note_encryption::OrchardDomain, 52>::enc_ciphertext(
+                ShieldedOutput::<::orchard::note_encryption::OrchardDomain>::enc_ciphertext_compact(
                     &compact_action,
-                )[..52]
+                )
+                .0[..52]
                     .to_vec(),
         },
         note,
@@ -2632,6 +2633,7 @@ fn compact_ironwood_action<R: RngCore + CryptoRng>(
     let note = Note::from_parts(
         recipient,
         ::orchard::value::NoteValue::from_raw(value.into_u64()),
+        ::orchard::note::AssetBase::zatoshi(),
         rho,
         rseed,
         NoteVersion::V3,
@@ -2647,7 +2649,7 @@ fn compact_ironwood_action<R: RngCore + CryptoRng>(
             nullifier: nf_old.to_bytes().to_vec(),
             cmx: cmx.to_bytes().to_vec(),
             ephemeral_key: ephemeral_key.0.to_vec(),
-            ciphertext: enc_ciphertext[..52].to_vec(),
+            ciphertext: enc_ciphertext.0[..52].to_vec(),
         },
         note,
     )
@@ -2771,7 +2773,9 @@ fn fake_compact_block_from_tx(
     }
 
     #[cfg(feature = "orchard")]
-    if let Some(bundle) = tx.orchard_bundle() {
+    if let Some(bundle) = tx.orchard_bundle()
+        && let Some(bundle) = bundle.as_vanilla()
+    {
         for action in bundle.actions() {
             ctx.actions.push(action.into());
         }

@@ -119,9 +119,11 @@ pub struct Signer {
     global: Global,
     transparent: transparent::pczt::Bundle,
     sapling: crate::sapling::Parsed,
-    orchard: crate::orchard::Parsed,
+    orchard: crate::PcztOrchardBundle,
     ironwood: crate::orchard::Parsed,
     empty_ironwood: Option<crate::orchard::Bundle>,
+    /// The issue bundle from the PCZT, preserved for `finish()`.
+    issue: crate::issue::Bundle,
     /// Cached across multiple signatures.
     tx_data: TransactionData<EffectsOnly>,
     txid_parts: TxDigests<Blake2bHash>,
@@ -146,6 +148,7 @@ impl Signer {
             sapling,
             orchard,
             ironwood,
+            issue,
             tx_data,
         } = pczt.extract_tx_data(
             anchor_requirement,
@@ -156,6 +159,10 @@ impl Signer {
             |s| s.extract_effects().map_err(ExtractError::SaplingExtract),
             |o| o.extract_effects().map_err(ExtractError::OrchardExtract),
             |i| i.extract_effects().map_err(ExtractError::IronwoodExtract),
+            #[cfg(feature = "zsa")]
+            |issue| Ok(issue.to_effects()),
+            #[cfg(feature = "zsa")]
+            |o| o.extract_effects().map_err(ExtractError::OrchardExtract),
         )?;
         let txid_parts = tx_data.digest(TxIdDigester);
         let shielded_sighash = sighash(&tx_data, &SignableInput::Shielded, &txid_parts);
@@ -167,6 +174,7 @@ impl Signer {
             orchard,
             ironwood,
             empty_ironwood,
+            issue,
             tx_data,
             txid_parts,
             shielded_sighash,
@@ -374,24 +382,48 @@ impl Signer {
         index: usize,
         ask: &orchard::keys::SpendAuthorizingKey,
     ) -> Result<(), Error> {
-        self.generate_or_apply_orchard_signature(index, |spend, shielded_sighash| {
-            spend.sign(shielded_sighash, ask, OsRng)
-        })
+        self.orchard_sign_impl(index, Some(ask), None)
     }
 
-    /// Applies the given signature to the Orchard spend.
-    ///
-    /// It is the caller's responsibility to perform any semantic validity checks on the
-    /// PCZT (for example, comfirming that the change amounts are correct) before calling
-    /// this method.
     pub fn apply_orchard_signature(
         &mut self,
         index: usize,
         signature: redpallas::Signature<redpallas::SpendAuth>,
     ) -> Result<(), Error> {
-        self.generate_or_apply_orchard_signature(index, |action, shielded_sighash| {
-            action.apply_signature(shielded_sighash, signature)
-        })
+        self.orchard_sign_impl(index, None, Some(signature))
+    }
+
+    fn orchard_sign_impl(
+        &mut self,
+        index: usize,
+        ask: Option<&orchard::keys::SpendAuthorizingKey>,
+        sig: Option<redpallas::Signature<redpallas::SpendAuth>>,
+    ) -> Result<(), Error> {
+        let result = match &mut self.orchard {
+            crate::PcztOrchardBundle::Vanilla(parsed) => {
+                let action = parsed
+                    .bundle
+                    .actions_mut()
+                    .get_mut(index)
+                    .ok_or(Error::InvalidIndex)?;
+                Self::verify_and_sign_action(action, self.shielded_sighash, ask, sig)
+            }
+            #[cfg(feature = "zsa")]
+            crate::PcztOrchardBundle::Zsa(parsed) => {
+                let action = parsed
+                    .bundle
+                    .actions_mut()
+                    .get_mut(index)
+                    .ok_or(Error::InvalidIndex)?;
+                Self::verify_and_sign_action_zsa(action, self.shielded_sighash, ask, sig)
+            }
+        };
+        if result.is_ok() {
+            self.global.tx_modifiable &= !(FLAG_TRANSPARENT_INPUTS_MODIFIABLE
+                | FLAG_TRANSPARENT_OUTPUTS_MODIFIABLE
+                | FLAG_SHIELDED_MODIFIABLE);
+        }
+        result
     }
 
     /// Applies an externally produced Orchard-protocol spend authorization signature.
@@ -418,38 +450,64 @@ impl Signer {
         }
     }
 
-    fn generate_or_apply_orchard_signature<F>(&mut self, index: usize, f: F) -> Result<(), Error>
-    where
-        F: FnOnce(&mut orchard::pczt::Action, [u8; 32]) -> Result<(), orchard::pczt::SignerError>,
-    {
-        let action = self
-            .orchard
-            .bundle
-            .actions_mut()
-            .get_mut(index)
-            .ok_or(Error::InvalidIndex)?;
-
-        // Check consistency of the input being signed if we have its note components.
+    fn verify_and_sign_action(
+        action: &mut orchard::pczt::Action,
+        shielded_sighash: [u8; 32],
+        ask: Option<&orchard::keys::SpendAuthorizingKey>,
+        sig: Option<redpallas::Signature<redpallas::SpendAuth>>,
+    ) -> Result<(), Error> {
         match action.spend().verify_nullifier(None) {
             Err(
                 orchard::pczt::VerifyError::MissingRecipient
                 | orchard::pczt::VerifyError::MissingValue
                 | orchard::pczt::VerifyError::MissingRho
                 | orchard::pczt::VerifyError::MissingRandomSeed,
-            ) => Ok(()),
+            ) => return Ok(()),
             r => r,
         }
         .map_err(Error::OrchardVerify)?;
+        if let Some(sig) = sig {
+            action
+                .apply_signature(shielded_sighash, sig)
+                .map_err(Error::OrchardSign)?;
+        } else {
+            action
+                .sign(shielded_sighash, ask.unwrap(), OsRng)
+                .map_err(Error::OrchardSign)?;
+        }
+        Ok(())
+    }
 
-        // Generate or apply the signature.
-        f(action, self.shielded_sighash).map_err(Error::OrchardSign)?;
-
-        // Update transaction modifiability: all transaction effects have been committed
-        // to by the signature.
-        self.global.tx_modifiable &= !(FLAG_TRANSPARENT_INPUTS_MODIFIABLE
-            | FLAG_TRANSPARENT_OUTPUTS_MODIFIABLE
-            | FLAG_SHIELDED_MODIFIABLE);
-
+    #[cfg(feature = "zsa")]
+    fn verify_and_sign_action_zsa(
+        action: &mut orchard::pczt::Action<orchard::zsa::OrchardZSADomain>,
+        shielded_sighash: [u8; 32],
+        ask: Option<&orchard::keys::SpendAuthorizingKey>,
+        sig: Option<redpallas::Signature<redpallas::SpendAuth>>,
+    ) -> Result<(), Error> {
+        match action.spend().verify_nullifier(None) {
+            Err(
+                orchard::pczt::VerifyError::MissingRecipient
+                | orchard::pczt::VerifyError::MissingValue
+                | orchard::pczt::VerifyError::MissingRho
+                | orchard::pczt::VerifyError::MissingRandomSeed,
+            ) => return Ok(()),
+            r => r,
+        }
+        .map_err(Error::OrchardVerify)?;
+        action
+            .output()
+            .verify_note_commitment(action.spend())
+            .map_err(Error::OrchardVerify)?;
+        if let Some(sig) = sig {
+            action
+                .apply_signature(shielded_sighash, sig)
+                .map_err(Error::OrchardSign)?;
+        } else {
+            action
+                .sign(shielded_sighash, ask.unwrap(), OsRng)
+                .map_err(Error::OrchardSign)?;
+        }
         Ok(())
     }
 
@@ -529,6 +587,7 @@ impl Signer {
             orchard,
             ironwood,
             empty_ironwood,
+            issue,
             tx_data: _,
             txid_parts: _,
             shielded_sighash: _,
@@ -539,8 +598,13 @@ impl Signer {
             global,
             transparent: crate::transparent::Bundle::serialize_from(transparent),
             sapling: sapling.reserialize(),
-            orchard: orchard.reserialize(),
+            orchard: match orchard {
+                crate::PcztOrchardBundle::Vanilla(parsed) => parsed.reserialize(),
+                #[cfg(feature = "zsa")]
+                crate::PcztOrchardBundle::Zsa(parsed) => parsed.reserialize(),
+            },
             ironwood: empty_ironwood.unwrap_or_else(|| ironwood.reserialize()),
+            issue,
         }
     }
 }
@@ -617,7 +681,7 @@ mod tests {
 
         assert!(pczt.ironwood.anchor.is_none());
 
-        let pczt = IoFinalizer::new(pczt).finalize_io().unwrap();
+        let (pczt, _) = IoFinalizer::new(pczt).finalize_io().unwrap();
         assert!(pczt.ironwood.anchor.is_none());
         assert!(pczt.ironwood.bsk.is_some());
         // The IO Finalizer signs and clears the dummy spending key.

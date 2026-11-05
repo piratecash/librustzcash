@@ -41,7 +41,7 @@ use {
     std::convert::Infallible,
     transparent::{address::TransparentAddress, bundle::OutPoint},
     zcash_primitives::transaction::fees::{
-        transparent as transparent_fees, transparent::InputSize, zip317::P2PKH_STANDARD_INPUT_SIZE,
+        transparent::InputSize, zip317::P2PKH_STANDARD_INPUT_SIZE,
     },
     zip321::Payment,
 };
@@ -2180,9 +2180,9 @@ impl<DbT: InputSource> ShieldingSelector for GreedyInputSelector<DbT> {
             .fee_required(
                 params,
                 BlockHeight::from(target_height),
-                transparent_inputs
-                    .iter()
-                    .map(transparent_fees::InputView::serialized_size),
+                transparent_inputs.iter().map(
+                    ::zcash_primitives::transaction::fees::transparent::InputView::serialized_size,
+                ),
                 std::iter::empty::<usize>(),
                 0,
                 sapling_output_count,

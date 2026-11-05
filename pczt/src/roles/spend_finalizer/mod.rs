@@ -22,6 +22,7 @@ impl SpendFinalizer {
             sapling,
             orchard,
             ironwood,
+            issue,
         } = self.pczt;
 
         let mut transparent = transparent.into_parsed().map_err(Error::TransparentParse)?;
@@ -36,6 +37,7 @@ impl SpendFinalizer {
             sapling,
             orchard,
             ironwood,
+            issue,
         })
     }
 }

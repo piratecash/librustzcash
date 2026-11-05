@@ -12,6 +12,7 @@ impl super::Verifier {
             sapling,
             orchard,
             ironwood,
+            ..
         } = self.pczt;
         let anchor_requirement = AnchorRequirement::for_pre_authorization(global.tx_version);
 
@@ -28,6 +29,7 @@ impl super::Verifier {
                 sapling: parsed.reserialize(),
                 orchard,
                 ironwood,
+                issue: Default::default(),
             },
         })
     }

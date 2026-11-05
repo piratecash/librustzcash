@@ -11,31 +11,75 @@ impl super::Prover {
             sapling,
             orchard,
             ironwood,
+            issue,
         } = self.pczt;
 
-        let mut parsed = orchard
-            .into_parsed_with_version(
-                crate::orchard::orchard_bundle_version(&global)
-                    .ok_or(OrchardError::UnsupportedConsensusBranchId)?,
-                AnchorRequirement::Required,
-            )
-            .map_err(OrchardError::Parser)?;
+        let bundle_version = crate::orchard::orchard_bundle_version(&global)
+            .ok_or(OrchardError::UnsupportedConsensusBranchId)?;
 
-        crate::orchard::verify_witnesses_root_to_anchor(&parsed.bundle, *parsed.bundle.anchor())
-            .map_err(OrchardError::InconsistentWitness)?;
+        #[cfg(feature = "zsa")]
+        let is_nu7 = u32::from(
+            zcash_protocol::consensus::BranchId::try_from(global.consensus_branch_id)
+                .unwrap_or(zcash_protocol::consensus::BranchId::Nu5),
+        ) == u32::from(zcash_protocol::consensus::BranchId::Nu7);
 
-        parsed
-            .bundle
-            .create_proof(pk, OsRng)
-            .map_err(OrchardError::Prover)?;
+        let orchard_raw = {
+            #[cfg(feature = "zsa")]
+            if is_nu7 {
+                let mut parsed = orchard
+                    .into_parsed_with_version_zsa(bundle_version, AnchorRequirement::Required)
+                    .map_err(OrchardError::Parser)?;
+                crate::orchard::verify_witnesses_root_to_anchor(
+                    &parsed.bundle,
+                    *parsed.bundle.anchor(),
+                )
+                .map_err(OrchardError::InconsistentWitness)?;
+                parsed
+                    .bundle
+                    .create_proof(pk, OsRng)
+                    .map_err(OrchardError::Prover)?;
+                parsed.reserialize()
+            } else {
+                let mut parsed = orchard
+                    .into_parsed_with_version(bundle_version, AnchorRequirement::Required)
+                    .map_err(OrchardError::Parser)?;
+                crate::orchard::verify_witnesses_root_to_anchor(
+                    &parsed.bundle,
+                    *parsed.bundle.anchor(),
+                )
+                .map_err(OrchardError::InconsistentWitness)?;
+                parsed
+                    .bundle
+                    .create_proof(pk, OsRng)
+                    .map_err(OrchardError::Prover)?;
+                parsed.reserialize()
+            }
+            #[cfg(not(feature = "zsa"))]
+            {
+                let mut parsed = orchard
+                    .into_parsed_with_version(bundle_version, AnchorRequirement::Required)
+                    .map_err(OrchardError::Parser)?;
+                crate::orchard::verify_witnesses_root_to_anchor(
+                    &parsed.bundle,
+                    *parsed.bundle.anchor(),
+                )
+                .map_err(OrchardError::InconsistentWitness)?;
+                parsed
+                    .bundle
+                    .create_proof(pk, OsRng)
+                    .map_err(OrchardError::Prover)?;
+                parsed.reserialize()
+            }
+        };
 
         Ok(Self {
             pczt: Pczt {
                 global,
                 transparent,
                 sapling,
-                orchard: parsed.reserialize(),
+                orchard: orchard_raw,
                 ironwood,
+                issue,
             },
         })
     }
@@ -47,6 +91,7 @@ impl super::Prover {
             sapling,
             orchard,
             ironwood,
+            issue,
         } = self.pczt;
 
         let mut parsed = ironwood
@@ -68,6 +113,7 @@ impl super::Prover {
                 sapling,
                 orchard,
                 ironwood: parsed.reserialize(),
+                issue,
             },
         })
     }

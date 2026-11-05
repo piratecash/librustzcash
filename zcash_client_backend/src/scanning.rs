@@ -874,14 +874,14 @@ where
 fn find_received<
     AccountId: Copy + Eq + Hash,
     D: BatchDomain,
+    KeyDomain: Domain<Note = D::Note, IncomingViewingKey = D::IncomingViewingKey>,
     M,
     Nf,
     IvkTag: Copy + std::hash::Hash + Eq + Send + 'static,
-    SK: ScanningKeyOps<D, AccountId, Nf>,
-    Output: ShieldedOutput<D, CIPHERTEXT_SIZE>,
+    SK: ScanningKeyOps<KeyDomain, AccountId, Nf>,
+    Output: ShieldedOutput<D>,
     NoteCommitment,
     Note,
-    const CIPHERTEXT_SIZE: usize,
 >(
     block_height: BlockHeight,
     last_commitments_in_block: bool,
@@ -1109,7 +1109,7 @@ pub mod testing {
         let cout = CompactSaplingOutput {
             cmu,
             ephemeral_key,
-            ciphertext: enc_ciphertext[..52].to_vec(),
+            ciphertext: enc_ciphertext.as_ref()[..52].to_vec(),
         };
         let mut ctx = CompactTx::default();
         let mut txid = vec![0; 32];
