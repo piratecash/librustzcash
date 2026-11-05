@@ -15,6 +15,11 @@ workspace.
   for constructing signed transactions from a proposal without storing them as
   pending sent transactions in the wallet database. (piratecash fork)
 
+### Changed
+- Transactions created from proposals targeting NU7 or later get the default expiry
+  delta of `zcash_primitives::transaction::builder::default_tx_expiry_delta`, which is
+  120 blocks from NU7.
+
 ## [0.24.0-rc.4] - 2026-07-26
 
 ### Changed

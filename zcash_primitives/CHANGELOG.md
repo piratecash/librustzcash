@@ -10,6 +10,17 @@ workspace.
 
 ## [Unreleased]
 
+### Added
+- `zcash_primitives::transaction::builder::{OVERWINTER_DEFAULT_TX_EXPIRY_DELTA,
+  NU7_DEFAULT_TX_EXPIRY_DELTA, default_tx_expiry_delta}`
+
+### Changed
+- `TxVersion` handles `BranchId::Nu7`: V6 is the suggested version, V4 is invalid and V5
+  remains valid. The Ironwood pool is available under it.
+- `Builder::new` and `DeferredPcztBuilder::new` take the default expiry delta from the
+  consensus branch at the target height: 20 blocks before Blossom, 40 until NU7, and 120
+  from NU7. Coinbase transactions still expire at the target height.
+
 ## [0.30.0] - 2026-07-23
 
 ### Added

@@ -43,7 +43,7 @@ impl super::Updater {
         })
     }
 
-    /// Updates an NU7 Orchard bundle using the ZSA note-encryption domain.
+    /// Updates a ZSA Orchard bundle using the ZSA note-encryption domain.
     #[cfg(feature = "zsa")]
     pub fn update_orchard_zsa_with<F>(self, f: F) -> Result<Self, OrchardError>
     where

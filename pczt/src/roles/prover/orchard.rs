@@ -18,14 +18,14 @@ impl super::Prover {
             .ok_or(OrchardError::UnsupportedConsensusBranchId)?;
 
         #[cfg(feature = "zsa")]
-        let is_nu7 = u32::from(
+        let is_zsa = u32::from(
             zcash_protocol::consensus::BranchId::try_from(global.consensus_branch_id)
                 .unwrap_or(zcash_protocol::consensus::BranchId::Nu5),
         ) == u32::from(zcash_protocol::consensus::BranchId::Zsa);
 
         let orchard_raw = {
             #[cfg(feature = "zsa")]
-            if is_nu7 {
+            if is_zsa {
                 let mut parsed = orchard
                     .into_parsed_with_version_zsa(bundle_version, AnchorRequirement::Required)
                     .map_err(OrchardError::Parser)?;

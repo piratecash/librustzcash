@@ -68,6 +68,173 @@ fn suggested_version_for_v5_branches_is_not_v6() {
     );
 }
 
+#[test]
+fn valid_in_branch_nu7_rejects_v4_and_accepts_v5_and_v6() {
+    assert!(!TxVersion::V4.valid_in_branch(BranchId::Nu7));
+    assert!(TxVersion::V5.valid_in_branch(BranchId::Nu7));
+    assert!(TxVersion::V6.valid_in_branch(BranchId::Nu7));
+    assert_eq!(
+        TxVersion::suggested_for_branch(BranchId::Nu7),
+        TxVersion::V6
+    );
+}
+
+#[cfg(all(not(zcash_unstable = "nu7"), feature = "zsa", feature = "zip-233"))]
+#[test]
+fn zsa_v6_preserves_deployed_header_and_stream_boundary() {
+    // This is an empty codec fixture, not a spendable transaction. ZSA retains
+    // its deployed branch ID, version group, and eight-byte header amount.
+    const ENCODED: &str = concat!(
+        "06000080",
+        "77777777",
+        "d80a1977",
+        "00000000",
+        "01000000",
+        "0000000000000000",
+        "00000000000000",
+    );
+    const TRAILER: &[u8] = b"next-record";
+    let tx = TransactionData::from_parts_zsa(
+        BranchId::Zsa,
+        0,
+        1u32.into(),
+        Zatoshis::ZERO,
+        None,
+        None,
+        None,
+        None,
+    )
+    .freeze()
+    .unwrap();
+    let encoded = hex::decode(ENCODED).unwrap();
+    assert_eq!(tx_bytes(&tx), encoded);
+    let mut stream = encoded.clone();
+    stream.extend_from_slice(TRAILER);
+    let mut reader = stream.as_slice();
+    let parsed = Transaction::read(&mut reader, BranchId::Zsa).unwrap();
+    assert_eq!(reader, TRAILER);
+    assert_eq!(parsed.txid(), tx.txid());
+    assert_eq!(tx_bytes(&parsed), encoded);
+    assert_eq!(u32::from(parsed.consensus_branch_id()), 0x7719_0ad8);
+}
+
+/// An empty NU7 v6 codec fixture, not a spendable transaction. The six zero counts encode
+/// transparent inputs/outputs, Sapling spends/outputs, Orchard actions, and Ironwood actions.
+/// With no transparent bundle, the shielded signature digest equals this transaction digest.
+#[cfg(not(zcash_unstable = "nu7"))]
+#[test]
+fn nu7_v6_encoding_and_digests_are_feature_independent() {
+    const ENCODED: &str = "0600008098b684d8d90a19770000000001000000000000000000";
+    const HEADER_DIGEST: &str = "199b8446da5a9247711a94527997d7e87c31dfe5e8efb4b34d020a2aee8ee1c5";
+    const TX_DIGEST: &str = "78296c68a370c2e1f058d997c81c7b011c4562c52fc5ca2994ad59cd179fbe9e";
+    /// The smallest nonzero expiry height, used only to distinguish header fields.
+    const EXPIRY_HEIGHT: u32 = 1;
+    /// A suffix owned by an enclosing stream, which transaction parsing must not consume.
+    const TRAILER: &[u8] = b"next-record";
+
+    let encoded = hex::decode(ENCODED).unwrap();
+    let expected_digest = hex::decode(TX_DIGEST).unwrap();
+    let data = TransactionData::<TestUnauthorized>::from_parts_v6(
+        BranchId::Nu7,
+        0,
+        EXPIRY_HEIGHT.into(),
+        #[cfg(feature = "zip-233")]
+        Zatoshis::ZERO,
+        None,
+        None,
+        None,
+        None,
+    );
+    let digests = data.digest(TxIdDigester);
+    assert_eq!(
+        digests.header_digest.as_bytes(),
+        hex::decode(HEADER_DIGEST).unwrap()
+    );
+    assert_eq!(v6_shielded_sighash(&data).as_bytes(), expected_digest);
+    assert_eq!(
+        crate::transaction::sighash::signature_hash(&data, &SignableInput::Shielded, &digests)
+            .as_ref(),
+        expected_digest.as_slice()
+    );
+
+    let tx = TransactionData::from_parts_v6(
+        BranchId::Nu7,
+        0,
+        EXPIRY_HEIGHT.into(),
+        #[cfg(feature = "zip-233")]
+        Zatoshis::ZERO,
+        None,
+        None,
+        None,
+        None,
+    )
+    .freeze()
+    .unwrap();
+    assert_eq!(tx_bytes(&tx), encoded);
+    assert_eq!(tx.txid().as_ref().as_slice(), expected_digest);
+
+    let mut stream = encoded.clone();
+    stream.extend_from_slice(TRAILER);
+    let mut reader = stream.as_slice();
+    let parsed = Transaction::read(&mut reader, BranchId::Nu7).unwrap();
+    assert_eq!(reader, TRAILER);
+    assert_eq!(parsed.txid(), tx.txid());
+    assert_eq!(tx_bytes(&parsed), encoded);
+    for end in 0..encoded.len() {
+        assert!(Transaction::read(&encoded[..end], BranchId::Nu7).is_err());
+    }
+}
+
+#[cfg(not(zcash_unstable = "nu7"))]
+#[test]
+fn nu7_v5_encoding_and_digests_are_feature_independent() {
+    // Empty codec fixture calculated independently with Python hashlib.blake2b,
+    // using the ZIP 244 header and empty transparent, Sapling, and Orchard digests.
+    const ENCODED: &str = "050000800a27a726d90a197700000000010000000000000000";
+    const DIGEST: &str = "328d975581fbf002206ef6f0b69fe57fb47f40ec31c59ac62c3565d4e259e128";
+    /// The smallest nonzero expiry height, matching the v6 fixture.
+    const EXPIRY_HEIGHT: u32 = 1;
+    let data = TransactionData::<TestUnauthorized>::from_parts(
+        TxVersion::V5,
+        BranchId::Nu7,
+        0,
+        EXPIRY_HEIGHT.into(),
+        #[cfg(feature = "zip-233")]
+        Zatoshis::ZERO,
+        None,
+        None,
+        None,
+        None,
+    );
+    let expected = hex::decode(DIGEST).unwrap();
+    assert_eq!(v5_shielded_sighash(&data).as_bytes(), expected);
+    let tx = TransactionData::from_parts(
+        TxVersion::V5,
+        BranchId::Nu7,
+        0,
+        EXPIRY_HEIGHT.into(),
+        #[cfg(feature = "zip-233")]
+        Zatoshis::ZERO,
+        None,
+        None,
+        None,
+        None,
+    )
+    .freeze()
+    .unwrap();
+    let encoded = hex::decode(ENCODED).unwrap();
+    assert_eq!(tx_bytes(&tx), encoded);
+    assert_eq!(tx.txid().as_ref().as_slice(), expected);
+    let mut reader = encoded.as_slice();
+    assert_eq!(
+        Transaction::read(&mut reader, BranchId::Nu7)
+            .unwrap()
+            .txid(),
+        tx.txid()
+    );
+    assert!(reader.is_empty());
+}
+
 #[cfg(all(test, not(zcash_unstable = "nu7")))]
 #[test]
 fn v4_transactions_remain_valid_in_nu6_3() {
@@ -950,13 +1117,18 @@ proptest! {
     fn tx_serialization_roundtrip_nu6_3(tx in arb_tx(BranchId::Nu6_3)) {
         check_roundtrip(tx)?;
     }
+
+    #[test]
+    fn tx_serialization_roundtrip_nu7(tx in arb_tx(BranchId::Nu7)) {
+        check_roundtrip(tx)?;
+    }
 }
 
 #[cfg(test)]
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(10))]
     #[test]
-    fn tx_serialization_roundtrip_nu7(tx in arb_tx(BranchId::Zsa)) {
+    fn tx_serialization_roundtrip_zsa(tx in arb_tx(BranchId::Zsa)) {
         check_roundtrip(tx)?;
     }
 }

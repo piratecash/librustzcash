@@ -427,9 +427,9 @@ pub mod v2 {
                 Some([0; 32]),
                 Some([0; 32]),
             )
-            .expect("NU7 is supported")
+            .expect("ZSA is supported")
             .build()
-            .expect("NU7 PCZT is valid");
+            .expect("ZSA PCZT is valid");
             pczt.orchard.actions.push(Action {
                 cv_net: Some([0; 32]),
                 spend: Spend {
@@ -642,8 +642,8 @@ impl Pczt {
                     return Err(ExtractError::IronwoodNotSupported.into());
                 }
             }
-            // The v6 transaction format is only valid under NU6.3 (Ironwood) and
-            // NU7 (ZSA). Reject it under any other consensus branch.
+            // The v6 transaction format is only valid under NU6.3 (Ironwood), NU7 and
+            // ZSA. Reject it under any other consensus branch.
             TxVersion::V6 => {
                 if !TxVersion::V6.valid_in_branch(consensus_branch_id) {
                     return Err(ExtractError::UnsupportedConsensusBranchId.into());
@@ -918,9 +918,43 @@ pub enum ParseError {
 
 #[cfg(all(test, any(feature = "io-finalizer", feature = "signer")))]
 mod extraction_tests {
+    use zcash_primitives::transaction::{
+        TxVersion,
+        sighash::SignableInput,
+        txid::{TxIdDigester, to_txid},
+    };
     use zcash_protocol::consensus::BranchId;
 
     use crate::{ExtractError, roles::creator::Creator};
+
+    #[test]
+    fn nu7_pczt_preserves_canonical_v6_digests() {
+        /// Match the independent empty NU7 v6 fixture in the transaction codec tests.
+        const EXPIRY_HEIGHT: u32 = 1;
+        /// Mainnet's registered coin type; no keys or addresses are present in this fixture.
+        const COIN_TYPE: u32 = 133;
+        /// Independently calculated with Python hashlib.blake2b using ZIP 244/229 domains.
+        const EXPECTED_DIGEST: &str =
+            "78296c68a370c2e1f058d997c81c7b011c4562c52fc5ca2994ad59cd179fbe9e";
+        let pczt = Creator::new(BranchId::Nu7.into(), EXPIRY_HEIGHT, COIN_TYPE, None, None)
+            .unwrap()
+            .build()
+            .unwrap();
+        let data = pczt.into_effects().unwrap();
+        assert_eq!(data.version(), TxVersion::V6);
+        let digests = data.digest(TxIdDigester);
+        let expected = hex::decode(EXPECTED_DIGEST).unwrap();
+        assert_eq!(
+            to_txid(data.version(), data.consensus_branch_id(), &digests)
+                .as_ref()
+                .as_slice(),
+            expected
+        );
+        assert_eq!(
+            crate::sighash(&data, &SignableInput::Shielded, &digests).as_slice(),
+            expected
+        );
+    }
 
     #[test]
     fn v5_pczt_with_ironwood_data_does_not_extract() {

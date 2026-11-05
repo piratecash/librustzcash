@@ -646,7 +646,7 @@ pub struct Spend {
     #[getset(get = "pub")]
     pub(crate) proprietary: BTreeMap<String, Vec<u8>>,
 
-    /// The asset base of the note being spent. Required for NU7 actions,
+    /// The asset base of the note being spent. Required for ZSA actions,
     /// including native ZEC; older Orchard actions may omit it.
     ///
     /// Required by Verifiers/Provers to reconstruct the ZSA note commitment.
@@ -726,7 +726,7 @@ pub struct Output {
     #[getset(get = "pub")]
     pub(crate) proprietary: BTreeMap<String, Vec<u8>>,
 
-    /// The asset base of the output note. Required for NU7 actions,
+    /// The asset base of the output note. Required for ZSA actions,
     /// including native ZEC; older Orchard actions may omit it.
     ///
     /// Required by Provers to reconstruct the ZSA note commitment.

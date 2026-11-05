@@ -52,9 +52,40 @@ use core::convert::Infallible;
 
 use super::components::sapling::zip212_enforcement;
 
-/// Since Blossom activation, the default transaction expiry delta should be 40 blocks.
+/// The default transaction expiry delta before Blossom activation.
+/// <https://zips.z.cash/zip-0203>
+pub const OVERWINTER_DEFAULT_TX_EXPIRY_DELTA: u32 = 20;
+
+/// The default transaction expiry delta from Blossom activation until NU7 activation.
+/// Use [`default_tx_expiry_delta`] when building a transaction for a known branch.
 /// <https://zips.z.cash/zip-0203#changes-for-blossom>
 pub const DEFAULT_TX_EXPIRY_DELTA: u32 = 40;
+
+/// The default transaction expiry delta from NU7 activation: the same 50 minutes as
+/// [`DEFAULT_TX_EXPIRY_DELTA`] at the 25-second block spacing.
+/// <https://zips.z.cash/zip-0218#default-expiry-delta>
+pub const NU7_DEFAULT_TX_EXPIRY_DELTA: u32 = 120;
+
+/// Returns the default expiry delta, in blocks, for a transaction built under the rules of the
+/// given consensus branch.
+pub fn default_tx_expiry_delta(consensus_branch_id: BranchId) -> u32 {
+    match consensus_branch_id {
+        BranchId::Sprout | BranchId::Overwinter | BranchId::Sapling => {
+            OVERWINTER_DEFAULT_TX_EXPIRY_DELTA
+        }
+        BranchId::Blossom
+        | BranchId::Heartwood
+        | BranchId::Canopy
+        | BranchId::Nu5
+        | BranchId::Nu6
+        | BranchId::Nu6_1
+        | BranchId::Nu6_2
+        | BranchId::Nu6_3 => DEFAULT_TX_EXPIRY_DELTA,
+        // The deployed ZSA protocol keeps the 75-second block spacing.
+        BranchId::Zsa => DEFAULT_TX_EXPIRY_DELTA,
+        BranchId::Nu7 => NU7_DEFAULT_TX_EXPIRY_DELTA,
+    }
+}
 
 /// Errors that can occur during fee calculation.
 #[derive(Debug)]
@@ -484,8 +515,8 @@ impl<P: consensus::Parameters> DeferredPcztBuilder<P> {
     /// Creates a builder targeting the block at `target_height`, with the given
     /// transactional bundle padding for each Orchard-family pool.
     ///
-    /// The expiry height defaults to `target_height` plus the default transaction expiry
-    /// delta; override it with [`Self::with_expiry_height`].
+    /// The expiry height defaults to `target_height` plus [`default_tx_expiry_delta`] for the
+    /// consensus branch in effect there; override it with [`Self::with_expiry_height`].
     ///
     /// Returns [`Error::AnchorDeferralUnsupported`] if the consensus branch in effect at
     /// `target_height` does not use the V6 transaction format, whose txid and sighash
@@ -525,7 +556,7 @@ impl<P: consensus::Parameters> DeferredPcztBuilder<P> {
             tx_version,
             consensus_branch_id,
             target_height,
-            expiry_height: target_height + DEFAULT_TX_EXPIRY_DELTA,
+            expiry_height: target_height + default_tx_expiry_delta(consensus_branch_id),
             orchard_builder,
             orchard_bundle_version,
             ironwood_builder,
@@ -960,6 +991,7 @@ impl<P, U> Builder<P, U> {
             // (V6) and the consensus branch is one in which Ironwood is active.
             let ironwood_branch = match self.consensus_branch_id {
                 BranchId::Nu6_3 => true,
+                BranchId::Nu7 => true,
                 BranchId::Zsa => false, // ZSA: no Ironwood pool
                 _ => false,
             };
@@ -997,8 +1029,8 @@ impl<P: consensus::Parameters> Builder<P, ()> {
     ///
     /// # Default values
     ///
-    /// The expiry height will be set to the given height plus the default transaction
-    /// expiry delta (20 blocks).
+    /// The expiry height will be set to the given height plus [`default_tx_expiry_delta`] for
+    /// the consensus branch in effect at that height.
     pub fn new(params: P, target_height: BlockHeight, build_config: BuildConfig) -> Self {
         let consensus_branch_id = BranchId::for_height(&params, target_height);
         // `bundle_version_for_branch` returns `Some` exactly for the branches in
@@ -1012,7 +1044,7 @@ impl<P: consensus::Parameters> Builder<P, ()> {
         let orchard_builder = bundle_version.and_then(|v| build_config.orchard_builder(v));
         let orchard_bundle_version = orchard_builder.as_ref().and(bundle_version);
 
-        // The Ironwood builder only exists on NU6.3. NU7 uses ZSA issuance instead.
+        // ZSA has no Ironwood builder; it uses issuance instead.
         let ironwood_builder = if tx_version.has_ironwood() && consensus_branch_id != BranchId::Zsa
         {
             build_config.ironwood_builder()
@@ -1042,7 +1074,7 @@ impl<P: consensus::Parameters> Builder<P, ()> {
         let expiry_height = if build_config.is_coinbase() {
             target_height
         } else {
-            target_height + DEFAULT_TX_EXPIRY_DELTA
+            target_height + default_tx_expiry_delta(consensus_branch_id)
         };
 
         Builder {
@@ -1429,7 +1461,7 @@ impl<P: consensus::Parameters, U> Builder<P, U> {
             })
             .map_err(FeeError::Bundle)?;
 
-        // On NU7 (ZSA), issuance actions are counted alongside Ironwood actions
+        // On ZSA, issuance actions are counted alongside Ironwood actions
         // for fee calculation since they occupy the same bundle slot.
         #[cfg(feature = "zsa")]
         let issue_actions = self
@@ -2066,7 +2098,7 @@ mod tests {
 
     #[cfg(feature = "transparent-inputs")]
     use {
-        crate::transaction::{OutPoint, TxOut, TxVersion, builder::DEFAULT_TX_EXPIRY_DELTA},
+        crate::transaction::{OutPoint, TxOut, TxVersion, builder::default_tx_expiry_delta},
         ::transparent::keys::{AccountPrivKey, IncomingViewingKey},
         zcash_protocol::consensus::BranchId,
         zip32::AccountId,
@@ -2092,13 +2124,14 @@ mod tests {
             nu6_1: Some(BlockHeight::from_u32(8)),
             nu6_2: Some(BlockHeight::from_u32(9)),
             nu6_3: Some(BlockHeight::from_u32(10)),
+            nu7: None,
             zsa: None,
             orchard_mode: zcash_protocol::consensus::OrchardMode::Normal,
         }
     }
 
     #[cfg(feature = "circuits")]
-    fn nu7_test_network() -> zcash_protocol::local_consensus::LocalNetwork {
+    fn zsa_test_network() -> zcash_protocol::local_consensus::LocalNetwork {
         use zcash_protocol::consensus::BlockHeight;
 
         zcash_protocol::local_consensus::LocalNetwork {
@@ -2112,9 +2145,152 @@ mod tests {
             nu6_1: Some(BlockHeight::from_u32(8)),
             nu6_2: Some(BlockHeight::from_u32(9)),
             nu6_3: Some(BlockHeight::from_u32(10)),
+            nu7: None,
             zsa: Some(BlockHeight::from_u32(11)),
             orchard_mode: zcash_protocol::consensus::OrchardMode::Normal,
         }
+    }
+
+    #[cfg(feature = "circuits")]
+    fn nu7_test_network() -> zcash_protocol::local_consensus::LocalNetwork {
+        zcash_protocol::local_consensus::LocalNetwork {
+            nu7: Some(zcash_protocol::consensus::BlockHeight::from_u32(11)),
+            ..nu6_3_test_network()
+        }
+    }
+
+    #[cfg(feature = "circuits")]
+    fn standard_build_config() -> BuildConfig {
+        BuildConfig::Standard {
+            sapling_anchor: None,
+            orchard_anchor: Some(orchard::Anchor::empty_tree()),
+            ironwood_anchor: Some(orchard::Anchor::empty_tree()),
+            orchard_padding: BundlePadding::DEFAULT,
+            ironwood_padding: BundlePadding::DEFAULT,
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "circuits")]
+    fn default_tx_expiry_delta_each_branch_returns_branch_delta() {
+        use super::default_tx_expiry_delta;
+        use zcash_protocol::consensus::BranchId::*;
+
+        for branch in [Sprout, Overwinter, Sapling] {
+            assert_eq!(default_tx_expiry_delta(branch), 20);
+        }
+        for branch in [
+            Blossom, Heartwood, Canopy, Nu5, Nu6, Nu6_1, Nu6_2, Nu6_3, Zsa,
+        ] {
+            assert_eq!(default_tx_expiry_delta(branch), 40);
+        }
+        assert_eq!(default_tx_expiry_delta(Nu7), 120);
+        assert_eq!(super::DEFAULT_TX_EXPIRY_DELTA, 40);
+    }
+
+    #[test]
+    #[cfg(feature = "circuits")]
+    fn new_around_nu7_activation_on_public_networks_switches_expiry_delta() {
+        use zcash_protocol::consensus::{MAIN_NETWORK, TEST_NETWORK};
+
+        fn expiry_delta<P: Parameters>(params: P, height: u32) -> u32 {
+            let builder = Builder::new(params, height.into(), standard_build_config());
+            u32::from(builder.expiry_height) - height
+        }
+
+        assert_eq!(expiry_delta(MAIN_NETWORK, 3_543_404), 40);
+        assert_eq!(expiry_delta(MAIN_NETWORK, 3_543_405), 120);
+        assert_eq!(expiry_delta(TEST_NETWORK, 4_465_025), 40);
+        assert_eq!(expiry_delta(TEST_NETWORK, 4_465_026), 120);
+    }
+
+    #[test]
+    #[cfg(feature = "circuits")]
+    fn deferred_pczt_builder_default_expiry_delta_increases_at_nu7_activation() {
+        use super::DeferredPcztBuilder;
+
+        let params = nu7_test_network();
+        let nu7_activation = params.activation_height(NetworkUpgrade::Nu7).unwrap();
+        let last_pre_nu7_height = nu7_activation - 1;
+
+        let pre_nu7 = DeferredPcztBuilder::new::<Infallible>(
+            params,
+            last_pre_nu7_height,
+            BundlePadding::DEFAULT,
+            BundlePadding::DEFAULT,
+        )
+        .unwrap();
+        assert_eq!(pre_nu7.expiry_height, last_pre_nu7_height + 40);
+
+        let post_nu7 = DeferredPcztBuilder::new::<Infallible>(
+            params,
+            nu7_activation,
+            BundlePadding::DEFAULT,
+            BundlePadding::DEFAULT,
+        )
+        .unwrap();
+        assert_eq!(post_nu7.expiry_height, nu7_activation + 120);
+    }
+
+    #[test]
+    #[cfg(feature = "circuits")]
+    fn new_coinbase_at_nu7_height_keeps_expiry_at_target_height() {
+        let params = nu7_test_network();
+        let nu7_activation = params.activation_height(NetworkUpgrade::Nu7).unwrap();
+
+        let builder = Builder::new(
+            params,
+            nu7_activation,
+            BuildConfig::Coinbase { miner_data: None },
+        );
+
+        assert_eq!(builder.expiry_height, nu7_activation);
+    }
+
+    #[test]
+    #[cfg(feature = "circuits")]
+    fn new_at_nu7_height_uses_v6_with_orchard_v3_and_ironwood() {
+        let builder = Builder::new(nu7_test_network(), 11u32.into(), standard_build_config());
+
+        assert_eq!(
+            builder.consensus_branch_id,
+            zcash_protocol::consensus::BranchId::Nu7
+        );
+        assert_eq!(builder.tx_version, crate::transaction::TxVersion::V6);
+        assert_eq!(
+            builder.orchard_bundle_version,
+            Some(orchard::bundle::BundleVersion::orchard_v3())
+        );
+        assert!(builder.ironwood_builder.is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "circuits")]
+    fn build_for_pczt_nu7_with_ironwood_output_passes_version_check() {
+        let mut builder = Builder::new(nu7_test_network(), 11u32.into(), standard_build_config());
+        let recipient = orchard::keys::FullViewingKey::from(
+            &orchard::keys::SpendingKey::from_bytes([0; 32]).unwrap(),
+        )
+        .address_at(0u32, orchard::keys::Scope::External);
+        builder
+            .add_ironwood_output::<crate::transaction::fees::zip317::FeeRule>(
+                None,
+                recipient,
+                Zatoshis::const_from_u64(10_000),
+                MemoBytes::empty(),
+            )
+            .unwrap();
+
+        // Reaching the balance check proves `TargetIncompatible` did not fire.
+        assert_matches!(
+            builder.build_for_pczt(
+                OsRng,
+                &crate::transaction::fees::zip317::FeeRule::standard(),
+                #[cfg(feature = "zsa")]
+                |_| false,
+            ),
+            Err(Error::InsufficientFunds(_))
+        );
     }
 
     #[test]
@@ -2178,9 +2354,9 @@ mod tests {
 
     #[test]
     #[cfg(feature = "circuits")]
-    fn nu7_coinbase_builder_exposes_orchard_v2() {
+    fn zsa_coinbase_builder_exposes_orchard_v2() {
         let builder = Builder::new(
-            nu7_test_network(),
+            zsa_test_network(),
             zcash_protocol::consensus::BlockHeight::from_u32(11),
             BuildConfig::Coinbase { miner_data: None },
         );
@@ -2770,7 +2946,7 @@ mod tests {
                 ironwood_padding: BundlePadding::DEFAULT,
             },
             target_height: sapling_activation_height,
-            expiry_height: sapling_activation_height + DEFAULT_TX_EXPIRY_DELTA,
+            expiry_height: sapling_activation_height + default_tx_expiry_delta(BranchId::Sapling),
             #[cfg(feature = "zip-233")]
             zip233_amount: Zatoshis::ZERO,
             transparent_builder: TransparentBuilder::empty(),

@@ -240,6 +240,7 @@ fn ensure_anchor_update_supported(global: &Global) -> Result<(), AnchorUpdateErr
 
     match BranchId::try_from(global.consensus_branch_id) {
         Ok(BranchId::Nu6_3) => Ok(()),
+        Ok(BranchId::Nu7) => Ok(()),
         #[cfg(zcash_unstable = "nu7")]
         Ok(BranchId::Zsa) => Ok(()),
         Ok(_) => Err(AnchorUpdateError::UnsupportedConsensusBranchId),
@@ -397,5 +398,36 @@ impl core::fmt::Display for SpendWitnessUpdateError {
                 )
             }
         }
+    }
+}
+
+#[cfg(all(test, any(feature = "sapling", feature = "orchard")))]
+mod tests {
+    use zcash_protocol::consensus::BranchId;
+
+    use super::{AnchorUpdateError, ensure_anchor_update_supported};
+    use crate::roles::creator::Creator;
+
+    fn global_for(branch: BranchId) -> crate::common::Global {
+        Creator::new(branch.into(), 10_000_000, 133, None, None)
+            .unwrap()
+            .build()
+            .unwrap()
+            .global
+    }
+
+    #[test]
+    fn ensure_anchor_update_supported_nu7_accepts() {
+        assert!(ensure_anchor_update_supported(&global_for(BranchId::Nu7)).is_ok());
+    }
+
+    #[test]
+    fn ensure_anchor_update_supported_v6_format_under_older_branch_rejects() {
+        let mut global = global_for(BranchId::Nu7);
+        global.consensus_branch_id = BranchId::Nu6_2.into();
+        assert!(matches!(
+            ensure_anchor_update_supported(&global),
+            Err(AnchorUpdateError::UnsupportedConsensusBranchId)
+        ));
     }
 }

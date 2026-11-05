@@ -10,6 +10,10 @@ workspace.
 
 ## [Unreleased]
 
+### Changed
+- `roles::creator::Creator` accepts `BranchId::Nu7`, producing the V6 transaction format
+  with `V6_VERSION_GROUP_ID`, and `roles::updater::Updater` accepts anchor updates under it.
+
 ## [0.9.1] - 2026-07-26
 
 ### Fixed

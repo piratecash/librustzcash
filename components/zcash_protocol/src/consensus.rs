@@ -530,6 +530,7 @@ impl Parameters for MainNetwork {
             NetworkUpgrade::Nu6_1 => Some(BlockHeight(3_146_400)),
             NetworkUpgrade::Nu6_2 => Some(BlockHeight(3_364_600)),
             NetworkUpgrade::Nu6_3 => Some(BlockHeight(3_428_143)),
+            NetworkUpgrade::Nu7 => Some(BlockHeight(3_543_405)),
             NetworkUpgrade::Zsa => None,
         }
     }
@@ -562,6 +563,7 @@ impl Parameters for TestNetwork {
             NetworkUpgrade::Nu6_1 => Some(BlockHeight(3_536_500)),
             NetworkUpgrade::Nu6_2 => Some(BlockHeight(4_052_000)),
             NetworkUpgrade::Nu6_3 => Some(BlockHeight(4_134_000)),
+            NetworkUpgrade::Nu7 => Some(BlockHeight(4_465_026)),
             NetworkUpgrade::Zsa => None,
         }
     }
@@ -639,6 +641,10 @@ pub enum NetworkUpgrade {
     Nu6_2,
     /// The Ironwood / NU6.3 network upgrade.
     Nu6_3,
+    /// The [Nu7] network upgrade.
+    ///
+    /// [Nu7]: https://z.cash/upgrade/nu7/
+    Nu7,
     /// The deployed Zcash Shielded Assets protocol, independent of official NU7.
     Zsa,
 }
@@ -659,6 +665,7 @@ impl fmt::Display for NetworkUpgrade {
             NetworkUpgrade::Nu6_1 => write!(f, "Nu6.1"),
             NetworkUpgrade::Nu6_2 => write!(f, "Nu6.2"),
             NetworkUpgrade::Nu6_3 => write!(f, "Nu6.3"),
+            NetworkUpgrade::Nu7 => write!(f, "Nu7"),
             NetworkUpgrade::Zsa => write!(f, "Zsa"),
         }
     }
@@ -680,6 +687,7 @@ impl NetworkUpgrade {
             NetworkUpgrade::Nu6_1 => BranchId::Nu6_1,
             NetworkUpgrade::Nu6_2 => BranchId::Nu6_2,
             NetworkUpgrade::Nu6_3 => BranchId::Nu6_3,
+            NetworkUpgrade::Nu7 => BranchId::Nu7,
             NetworkUpgrade::Zsa => BranchId::Zsa,
         }
     }
@@ -700,6 +708,9 @@ const UPGRADES_IN_ORDER: &[NetworkUpgrade] = &[
     NetworkUpgrade::Nu6_1,
     NetworkUpgrade::Nu6_2,
     NetworkUpgrade::Nu6_3,
+    NetworkUpgrade::Nu7,
+    // ZSA and NU7 never activate on the same network; Nu7 comes first because only it has
+    // mainnet and testnet heights.
     NetworkUpgrade::Zsa,
 ];
 
@@ -754,6 +765,8 @@ pub enum BranchId {
     Nu6_2,
     /// The consensus rules to be deployed by [`NetworkUpgrade::Nu6_3`].
     Nu6_3,
+    /// The consensus rules deployed by [`NetworkUpgrade::Nu7`].
+    Nu7,
     /// The deployed consensus rules for [`NetworkUpgrade::Zsa`].
     Zsa,
 }
@@ -777,6 +790,7 @@ impl TryFrom<u32> for BranchId {
             0x4dec_4df0 => Ok(BranchId::Nu6_1),
             0x5437_f330 => Ok(BranchId::Nu6_2),
             0x37a5_165b => Ok(BranchId::Nu6_3),
+            0x7719_0ad9 => Ok(BranchId::Nu7),
             0x7719_0ad8 => Ok(BranchId::Zsa), // ZSA
             _ => Err("Unknown consensus branch ID"),
         }
@@ -797,6 +811,7 @@ impl From<BranchId> for u32 {
             BranchId::Nu6_1 => 0x4dec_4df0,
             BranchId::Nu6_2 => 0x5437_f330,
             BranchId::Nu6_3 => 0x37a5_165b,
+            BranchId::Nu7 => 0x7719_0ad9,
             BranchId::Zsa => 0x7719_0ad8, // ZSA
         }
     }
@@ -835,6 +850,7 @@ impl BranchId {
             BranchId::Nu6_1 => NetworkUpgrade::Nu6_1,
             BranchId::Nu6_2 => NetworkUpgrade::Nu6_2,
             BranchId::Nu6_3 => NetworkUpgrade::Nu6_3,
+            BranchId::Nu7 => NetworkUpgrade::Nu7,
             BranchId::Zsa => NetworkUpgrade::Zsa,
         })
     }
@@ -897,9 +913,14 @@ impl BranchId {
             BranchId::Nu6_3 => params
                 .activation_height(NetworkUpgrade::Nu6_3)
                 .map(|lower| {
-                    let upper = params.activation_height(NetworkUpgrade::Zsa);
+                    let upper = params
+                        .activation_height(NetworkUpgrade::Nu7)
+                        .or_else(|| params.activation_height(NetworkUpgrade::Zsa));
                     (lower, upper)
                 }),
+            BranchId::Nu7 => params
+                .activation_height(NetworkUpgrade::Nu7)
+                .map(|lower| (lower, params.activation_height(NetworkUpgrade::Zsa))),
             BranchId::Zsa => params
                 .activation_height(NetworkUpgrade::Zsa)
                 .map(|lower| (lower, None)),
@@ -917,6 +938,7 @@ impl BranchId {
             Sprout | Overwinter | Sapling | Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1
             | Nu6_2 => true,
             BranchId::Nu6_3 => true,
+            BranchId::Nu7 => false,
             BranchId::Zsa => false,
         }
     }
@@ -928,6 +950,7 @@ impl BranchId {
             Sprout | Overwinter => false,
             Sapling | Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 => true,
             BranchId::Nu6_3 => true,
+            BranchId::Nu7 => true,
             BranchId::Zsa => true,
         }
     }
@@ -939,6 +962,7 @@ impl BranchId {
             Sprout | Overwinter | Sapling | Blossom | Heartwood | Canopy => false,
             Nu5 | Nu6 | Nu6_1 | Nu6_2 => true,
             BranchId::Nu6_3 => true,
+            BranchId::Nu7 => true,
             BranchId::Zsa => true,
         }
     }
@@ -952,7 +976,7 @@ impl BranchId {
             Sprout | Overwinter | Sapling | Blossom | Heartwood | Canopy => None,
             Nu5 | Nu6 | Nu6_1 => Some(OrchardProtocolRevision::InsecureV1),
             Nu6_2 => Some(OrchardProtocolRevision::V2),
-            Nu6_3 => Some(OrchardProtocolRevision::V3),
+            Nu6_3 | Nu7 => Some(OrchardProtocolRevision::V3),
             Zsa => Some(OrchardProtocolRevision::ZSA),
         }
     }
@@ -1005,6 +1029,7 @@ pub mod testing {
             BranchId::Nu6_1,
             BranchId::Nu6_2,
             BranchId::Nu6_3,
+            BranchId::Nu7,
             BranchId::Zsa,
         ])
     }
@@ -1050,7 +1075,8 @@ pub mod testing {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockHeight, BranchId, MAIN_NETWORK, NetworkUpgrade, Parameters, UPGRADES_IN_ORDER,
+        BlockHeight, BranchId, MAIN_NETWORK, NetworkUpgrade, Parameters, TEST_NETWORK,
+        UPGRADES_IN_ORDER,
     };
 
     #[test]
@@ -1087,6 +1113,25 @@ mod tests {
     }
 
     #[test]
+    fn nu7_branch_id_round_trip_and_retired_ids() {
+        /// The NU7 consensus branch identifier.
+        const NU7_BRANCH_ID: u32 = 0x7719_0ad9;
+        /// The identifier assigned to the earlier NU7 proposal.
+        const RETIRED_NU7_BRANCH_ID: u32 = 0x7719_0ad8;
+        /// The placeholder used before NU7 was assigned an identifier.
+        const NU7_PLACEHOLDER: u32 = 0xffff_ffff;
+
+        assert_eq!(BranchId::try_from(NU7_BRANCH_ID), Ok(BranchId::Nu7));
+        assert_eq!(u32::from(BranchId::Nu7), NU7_BRANCH_ID);
+        assert_eq!(
+            BranchId::try_from(u32::from(BranchId::Nu7)),
+            Ok(BranchId::Nu7),
+        );
+        assert_eq!(BranchId::try_from(RETIRED_NU7_BRANCH_ID), Ok(BranchId::Zsa));
+        assert!(BranchId::try_from(NU7_PLACEHOLDER).is_err());
+    }
+
+    #[test]
     fn orchard_protocol_revision() {
         use super::OrchardProtocolRevision;
 
@@ -1105,6 +1150,10 @@ mod tests {
         );
         assert_eq!(
             BranchId::Nu6_3.orchard_protocol_revision(),
+            Some(OrchardProtocolRevision::V3)
+        );
+        assert_eq!(
+            BranchId::Nu7.orchard_protocol_revision(),
             Some(OrchardProtocolRevision::V3)
         );
         assert_eq!(
@@ -1168,8 +1217,59 @@ mod tests {
             BranchId::Nu6_3,
         );
         assert_eq!(
-            BranchId::for_height(&MAIN_NETWORK, BlockHeight(5_000_000)),
+            BranchId::for_height(&MAIN_NETWORK, BlockHeight(3_543_404)),
             BranchId::Nu6_3,
         );
+        assert_eq!(
+            BranchId::for_height(&MAIN_NETWORK, BlockHeight(3_543_405)),
+            BranchId::Nu7,
+        );
+        assert_eq!(
+            BranchId::for_height(&MAIN_NETWORK, BlockHeight(5_000_000)),
+            BranchId::Nu7,
+        );
+    }
+
+    #[test]
+    fn for_height_testnet_around_nu7_activation_switches_branch() {
+        assert_eq!(
+            BranchId::for_height(&TEST_NETWORK, BlockHeight(4_465_025)),
+            BranchId::Nu6_3,
+        );
+        assert_eq!(
+            BranchId::for_height(&TEST_NETWORK, BlockHeight(4_465_026)),
+            BranchId::Nu7,
+        );
+    }
+
+    #[test]
+    fn height_bounds_mainnet_and_testnet_nu6_3_ends_where_nu7_starts() {
+        assert_eq!(
+            BranchId::Nu6_3.height_bounds(&MAIN_NETWORK),
+            Some((BlockHeight(3_428_143), Some(BlockHeight(3_543_405)))),
+        );
+        assert_eq!(
+            BranchId::Nu7.height_bounds(&MAIN_NETWORK),
+            Some((BlockHeight(3_543_405), None)),
+        );
+        assert_eq!(
+            BranchId::Nu6_3.height_bounds(&TEST_NETWORK),
+            Some((BlockHeight(4_134_000), Some(BlockHeight(4_465_026)))),
+        );
+        assert_eq!(
+            BranchId::Nu7.height_bounds(&TEST_NETWORK),
+            Some((BlockHeight(4_465_026), None)),
+        );
+        assert_eq!(BranchId::Zsa.height_bounds(&MAIN_NETWORK), None);
+        assert_eq!(BranchId::Zsa.height_bounds(&TEST_NETWORK), None);
+    }
+
+    #[test]
+    fn nu7_branch_rules_match_official_upgrade() {
+        assert!(!BranchId::Nu7.has_sprout());
+        assert!(BranchId::Nu7.has_sapling());
+        assert!(BranchId::Nu7.has_orchard());
+        assert_eq!(BranchId::Nu7.network_upgrade(), Some(NetworkUpgrade::Nu7));
+        assert_eq!(NetworkUpgrade::Nu7.branch_id(), BranchId::Nu7);
     }
 }

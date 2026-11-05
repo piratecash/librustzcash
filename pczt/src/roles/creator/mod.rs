@@ -111,7 +111,7 @@ impl Creator {
             | BranchId::Nu6
             | BranchId::Nu6_1
             | BranchId::Nu6_2 => (V5_TX_VERSION, V5_VERSION_GROUP_ID),
-            BranchId::Nu6_3 => (V6_TX_VERSION, V6_VERSION_GROUP_ID),
+            BranchId::Nu6_3 | BranchId::Nu7 => (V6_TX_VERSION, V6_VERSION_GROUP_ID),
             BranchId::Zsa => (V6_TX_VERSION, ZSA_V6_VERSION_GROUP_ID),
         };
 
@@ -180,7 +180,7 @@ impl Creator {
     /// bundle.
     pub fn with_ironwood_anchor(mut self, ironwood_anchor: [u8; 32]) -> Result<Self, Error> {
         // Ironwood anchor is only valid for the Ironwood (NU6.3) V6 transaction format,
-        // not for ZSA (NU7) which uses a different version group ID and carries an issue
+        // not for ZSA which uses a different version group ID and carries an issue
         // bundle instead.
         if self.version_group_id != V6_VERSION_GROUP_ID {
             return Err(Error::IronwoodNotSupported);
@@ -386,6 +386,19 @@ mod tests {
 
         let pczt = Creator::new(
             BranchId::Nu6_3.into(),
+            10_000_000,
+            133,
+            Some([0; 32]),
+            Some([0; 32]),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert_eq!(pczt.global.tx_version, V6_TX_VERSION);
+        assert_eq!(pczt.global.version_group_id, V6_VERSION_GROUP_ID);
+
+        let pczt = Creator::new(
+            BranchId::Nu7.into(),
             10_000_000,
             133,
             Some([0; 32]),

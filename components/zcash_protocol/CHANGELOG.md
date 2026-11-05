@@ -10,9 +10,17 @@ workspace.
 
 ## [Unreleased]
 
+### Added
+- `zcash_protocol::consensus::{NetworkUpgrade, BranchId}::Nu7`, the official NU7 upgrade:
+  consensus branch ID `0x77190ad9`, activating at height 3543405 on mainnet and 4465026
+  on testnet.
+- `zcash_protocol::local_consensus::LocalNetwork::nu7`
+
 ### Changed
 - The deployed ZSA protocol uses `BranchId::Zsa`, `NetworkUpgrade::Zsa`, and
   `LocalNetwork::zsa`, preserving its existing consensus branch ID and activation rules.
+- `BranchId::for_height` returns `BranchId::Nu7` from NU7 activation, and the height
+  range of `BranchId::Nu6_3` now ends there.
 
 ### Fixed
 - References to consensus parameters preserve their `OrchardMode`.

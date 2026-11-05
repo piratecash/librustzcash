@@ -493,11 +493,11 @@ pub mod testing {
         }
     }
 
-    /// Generates Ironwood bundles for the v6 transaction format outside NU7.
+    /// Generates Ironwood bundles for the v6 transaction format outside ZSA.
     ///
     /// Unlike the Orchard v6 pool, the Ironwood pool ([`BundleVersion::ironwood_v3`]) permits
     /// cross-address transfers, so this exercises the Ironwood serialization path the Orchard
-    /// generator cannot. NU7 uses the issuance slot instead of Ironwood.
+    /// generator cannot. ZSA uses the issuance slot instead of Ironwood.
     pub fn arb_ironwood_bundle_for_branch(
         v: TxVersion,
         branch_id: BranchId,
