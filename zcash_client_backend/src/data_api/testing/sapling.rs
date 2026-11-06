@@ -1,6 +1,6 @@
 use std::hash::Hash;
 
-use incrementalmerkletree::{Hashable, Level};
+use incrementalmerkletree::{Address as TreeAddress, Hashable, Level, Position};
 use sapling::{
     note_encryption::try_sapling_output_recovery,
     zip32::{DiversifiableFullViewingKey, ExtendedSpendingKey},
@@ -53,7 +53,7 @@ impl ShieldedPoolTester for SaplingPoolTester {
     }
 
     fn sk(seed: &[u8]) -> Self::Sk {
-        ExtendedSpendingKey::master(seed)
+        ExtendedSpendingKey::master(seed).expect("the derivation path yields a valid key")
     }
 
     fn sk_to_fvk(sk: &Self::Sk) -> Self::Fvk {
@@ -93,9 +93,8 @@ impl ShieldedPoolTester for SaplingPoolTester {
         st: &mut TestState<Cache, DbT, P>,
         shard_index: u64,
     ) -> Result<Self::MerkleTreeHash, ShardTreeError<<DbT as WalletCommitmentTrees>::Error>> {
-        use incrementalmerkletree::{Address, Position};
         let shard_height = crate::data_api::SAPLING_SHARD_HEIGHT;
-        let addr = Address::from_parts(Level::from(shard_height), shard_index);
+        let addr = TreeAddress::from_parts(Level::from(shard_height), shard_index);
         let end_position = Position::from((shard_index + 1) << shard_height);
         st.wallet_mut()
             .with_sapling_tree_mut(|tree| tree.root(addr, end_position))
@@ -215,7 +214,7 @@ impl ShieldedPoolTester for SaplingPoolTester {
                 // Assume all non-dummy spent notes are from the same account.
                 for index in non_dummy_spends {
                     updater.update_spend_with(index, |mut spend_updater| {
-                        spend_updater.set_proof_generation_key(extsk.expsk.proof_generation_key())
+                        spend_updater.set_proof_generation_key(extsk.expsk().proof_generation_key())
                     })?;
                 }
 
@@ -229,11 +228,13 @@ impl ShieldedPoolTester for SaplingPoolTester {
         signer: &mut pczt::roles::signer::Signer,
         usk: &UnifiedSpendingKey,
     ) -> Result<(), pczt::roles::signer::Error> {
+        use rand::{rand_core::UnwrapErr, rngs::SysRng};
+
         let extsk = Self::usk_to_sk(usk);
 
         // Figuring out which one is for us is hard. Let's just try signing all of them!
         for index in 0.. {
-            match signer.sign_sapling(index, &extsk.expsk.ask) {
+            match signer.sign_sapling(UnwrapErr(SysRng), index, extsk.expsk().ask()) {
                 // Loop termination.
                 Err(pczt::roles::signer::Error::InvalidIndex) => break,
                 // Ignore any errors due to using the wrong key.

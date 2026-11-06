@@ -1,7 +1,7 @@
 //! A builder for ZSA (Zcash Shielded Assets) issuance bundles.
 //!
 //! `ZsaBuilder` follows the same sub-builder delegation pattern used by
-//! [`TransparentBuilder`], [`sapling::builder::Builder`], and [`orchard::builder::Builder`].
+//! `TransparentBuilder`, [`sapling::builder::Builder`], and [`orchard::builder::Builder`].
 //! It wraps the issuance signing key and the partially-built [`IssueBundle`],
 //! providing a wallet-facing API for asset issuance, multi-asset minting, and finalization.
 
@@ -12,19 +12,19 @@ use orchard::{
     note::{AssetBase, Nullifier},
     value::NoteValue,
 };
-use rand_core::RngCore;
+use rand_core::Rng;
 
 /// A builder for constructing a ZSA issuance bundle.
 ///
 /// Create with [`ZsaBuilder::new`], add issuance outputs with
 /// [`add_issue_output`](ZsaBuilder::add_issue_output), optionally finalize
 /// assets with [`finalize_asset`](ZsaBuilder::finalize_asset), then hand
-/// the builder to [`Builder::set_zsa_builder`] or retrieve it via
-/// [`Builder::zsa_builder`].
+/// the builder to `Builder::set_zsa_builder` or retrieve it via
+/// `Builder::zsa_builder`.
 ///
 /// The cross-bundle dependency (ZIP-227: issuance notes need the first Orchard
 /// nullifier for rho derivation) is handled automatically inside
-/// [`Builder::build`] — the wallet does not need to add dummy Orchard actions.
+/// `Builder::build` — the wallet does not need to add dummy Orchard actions.
 #[derive(Debug)]
 pub struct ZsaBuilder {
     ik: IssueAuthKey<ZSASchnorr>,
@@ -49,7 +49,7 @@ impl ZsaBuilder {
     /// subsequent calls:
     /// - If `asset_desc_hash` matches an existing action, the notes are
     ///   appended to that action.
-    /// - If `asset_desc_hash` is new, a new [`IssueAction`] is created.
+    /// - If `asset_desc_hash` is new, a new `IssueAction` is created.
     ///
     /// If `first_issuance` is true, a zero-value reference note is prepended
     /// (required by consensus for the first issuance of an asset). Passing
@@ -63,7 +63,7 @@ impl ZsaBuilder {
         recipient: Address,
         value: NoteValue,
         first_issuance: bool,
-        rng: impl RngCore,
+        rng: impl Rng,
     ) -> Result<AssetBase, issuance::Error> {
         match self.bundle.as_mut() {
             Some(bundle) => {
@@ -134,12 +134,12 @@ impl ZsaBuilder {
     ///
     /// Returns `None` if the bundle was never initialized.
     ///
-    /// Called internally by the transaction [`Builder`] during
-    /// [`build`](super::Builder::build).
+    /// Called internally by the transaction `Builder` during
+    /// `build`.
     pub fn build(
         self,
         first_nullifier: &Nullifier,
-        rng: impl RngCore,
+        rng: impl Rng,
     ) -> Option<(IssueBundle<AwaitingSighash>, IssueAuthKey<ZSASchnorr>)> {
         self.bundle
             .map(|b| (b.update_rho(first_nullifier, rng), self.ik))

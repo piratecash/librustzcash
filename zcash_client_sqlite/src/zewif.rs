@@ -56,33 +56,42 @@
 //! * Encrypted secret stores must be decrypted by the caller (using the `zewif`
 //!   crate's decryption support) before import.
 
-use std::collections::{BTreeMap, HashMap};
-use std::fmt;
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+};
 
 use bech32::primitives::decode::CheckedHrpstring;
-use bip0039::{English, Mnemonic};
-use rand::RngCore;
+use bip0039::{
+    ChineseSimplified, ChineseTraditional, Czech, English, French, Italian, Japanese, Korean,
+    Mnemonic, Portuguese, Spanish,
+};
+use rand::Rng;
 use secrecy::{ExposeSecret, SecretVec};
-use zcash_client_backend::data_api::wallet::decrypt_and_store_transaction;
-use zcash_client_backend::data_api::{
-    Account as _, AccountBirthday, AccountPurpose, WalletWrite, Zip32Derivation, chain::ChainState,
+use zcash_client_backend::{
+    data_api::{
+        Account as _, AccountBirthday, AccountPurpose, WalletRead, WalletWrite, Zip32Derivation,
+        chain::ChainState, wallet::decrypt_and_store_transaction,
+    },
+    wallet::{Exposure, TransparentAddressMetadata},
 };
-use zcash_client_backend::wallet::{Exposure, TransparentAddressMetadata};
-use zcash_keys::keys::{UnifiedFullViewingKey, UnifiedSpendingKey};
-use zcash_primitives::block::BlockHash;
-use zcash_primitives::transaction::Transaction;
-use zcash_protocol::consensus::BranchId;
-use zcash_protocol::consensus::{
-    self, BlockHeight, NetworkConstants as _, NetworkType, NetworkUpgrade, Parameters,
+use zcash_keys::{
+    encoding::AddressCodec,
+    keys::{UnifiedFullViewingKey, UnifiedSpendingKey},
 };
-use zcash_protocol::{PoolType, ShieldedPool};
+use zcash_primitives::{block::BlockHash, transaction::Transaction};
+use zcash_protocol::{
+    PoolType, ShieldedPool,
+    consensus::{self, BlockHeight, BranchId, NetworkType, NetworkUpgrade, Parameters},
+};
 use zip32::fingerprint::SeedFingerprint;
 
-use ::transparent::address::TransparentAddress;
-use ::transparent::keys::TransparentKeyScope;
-use zcash_keys::encoding::AddressCodec;
+use ::transparent::{address::TransparentAddress, keys::TransparentKeyScope};
 
 use crate::{AccountUuid, WalletDb, error::SqliteClientError, util::Clock};
+use ::zewif::MnemonicLanguage as L;
+use incrementalmerkletree::frontier::Frontier;
+use zcash_script::script::{Code, Redeem};
 
 /// The Bech32m human-readable part of the canonical ZIP 32 seed fingerprint
 /// encoding used by ZeWIF documents.
@@ -159,6 +168,7 @@ impl SecretSink for DiscardSecrets {
 
 /// Errors that can occur while importing a ZeWIF document.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ZewifImportError<S> {
     /// A wallet in the document was recorded for a different network than the one
     /// described by the database's [`Parameters`].
@@ -532,13 +542,18 @@ pub struct ZewifImportReport {
     /// The number of transactions from the document that were stored because
     /// they involve the imported accounts.
     pub transactions_stored: usize,
-    /// The number of transactions from the document that were not stored,
-    /// either because trial decryption found no involvement with any imported
-    /// account, or because no imported account had established a chain tip
-    /// against which to store them. Such transactions are expected to be
-    /// recovered by the post-import rescan if they do in fact involve the
-    /// wallet.
+    /// The number of transactions from the document that were not stored
+    /// because trial decryption and transparent-output matching found no
+    /// involvement with any imported account. Such transactions are expected
+    /// to be recovered by the post-import rescan if they do in fact involve
+    /// the wallet.
     pub transactions_without_wallet_relevance: usize,
+    /// The number of transactions from the document that were deferred to the
+    /// post-import rescan because the wallet had no view of the chain tip
+    /// against which to store them. [`import_wallet`] seeds a chain view from
+    /// the document whenever at least one account is imported, so this is
+    /// nonzero primarily when no account could be imported.
+    pub transactions_deferred_no_chain_tip: usize,
     /// The number of transactions in the document that carried no raw
     /// transaction data and therefore could not be stored.
     pub transactions_without_raw_data: usize,
@@ -621,12 +636,6 @@ fn seed_entry_bytes<S>(
 /// Converts a BIP 39 mnemonic to its 64-byte seed, using the empty passphrase
 /// (as zcashd and zallet do).
 fn mnemonic_to_seed(m: &::zewif::Bip39Mnemonic) -> Result<Vec<u8>, bip0039::Error> {
-    use ::zewif::MnemonicLanguage as L;
-    use bip0039::{
-        ChineseSimplified, ChineseTraditional, Czech, French, Italian, Japanese, Korean,
-        Portuguese, Spanish,
-    };
-
     fn seed<L: bip0039::Language>(phrase: &str) -> Result<Vec<u8>, bip0039::Error> {
         Ok(Mnemonic::<L>::from_phrase(phrase)?.to_seed("").to_vec())
     }
@@ -660,7 +669,6 @@ fn convert_frontier<H, S, const DEPTH: u8>(
 where
     H: Clone,
 {
-    use incrementalmerkletree::frontier::Frontier;
     let invalid_node = || ZewifImportError::InvalidMerkleNode {
         account_name: account_name.to_owned(),
         pool,
@@ -878,7 +886,7 @@ where
     C: std::borrow::BorrowMut<rusqlite::Connection>,
     P: consensus::Parameters,
     CL: Clock,
-    R: RngCore,
+    R: Rng,
     S: SecretSink,
 {
     let params = wdb.params().clone();
@@ -967,6 +975,38 @@ where
         // no evidence that the indices below it were ever handed out; only the
         // exposures the document itself accounts for may be used to infer that.
         let pre_existing_exposures = exposed_receivers(wdb, &accounts)?;
+
+        // Storing transactions requires a view of the chain tip, which account
+        // import establishes only when an account's birthday lies above Sapling
+        // activation. Otherwise seed one from the document: its transactions
+        // exist at or below the maximum of its export height and their recorded
+        // mined heights, clamped to the wallet birthday so that scanning is
+        // never requested below it.
+        if !report.imported_accounts.is_empty()
+            && wdb
+                .chain_height()
+                .map_err(ZewifImportError::Wallet)?
+                .is_none()
+        {
+            let document_tip = document
+                .transactions()
+                .values()
+                .filter_map(|tx| tx.mined_height())
+                .max()
+                .map_or(document.export_height(), |h| {
+                    h.max(document.export_height())
+                });
+            let mut assumed_tip = BlockHeight::from(u32::from(document_tip));
+            if let Some(birthday) = wdb
+                .get_wallet_birthday()
+                .map_err(ZewifImportError::Wallet)?
+            {
+                assumed_tip = assumed_tip.max(birthday);
+            }
+            wdb.update_chain_tip(assumed_tip)
+                .map_err(ZewifImportError::Wallet)?;
+        }
+
         // Import transactions before marking document-recorded exposures, so
         // that the wallet's exposure state already reflects every address the
         // document's transactions reveal to have been used on-chain.
@@ -1001,15 +1041,14 @@ struct TransparentAddressRecords {
 /// uncompressed and the compressed (`0x01`-suffixed) payload forms.
 fn decode_wif(expected_prefix: u8, wif: &str) -> Option<secp256k1::SecretKey> {
     let payload = bs58::decode(wif).with_check(None).into_vec().ok()?;
-    match payload.as_slice() {
-        [prefix, key_data @ ..] if *prefix == expected_prefix && key_data.len() == 32 => {
-            secp256k1::SecretKey::from_slice(key_data).ok()
-        }
+    let key_data = match payload.as_slice() {
+        [prefix, key_data @ ..] if *prefix == expected_prefix && key_data.len() == 32 => key_data,
         [prefix, key_data @ .., 0x01] if *prefix == expected_prefix && key_data.len() == 32 => {
-            secp256k1::SecretKey::from_slice(key_data).ok()
+            key_data
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    secp256k1::SecretKey::from_secret_bytes(key_data.try_into().ok()?).ok()
 }
 
 /// Registers the secret store's standalone transparent spending keys with the
@@ -1023,7 +1062,7 @@ fn register_transparent_keys<DbT, P, S>(
     report: &mut ZewifImportReport,
 ) -> Result<(), ZewifImportError<S>>
 where
-    DbT: WalletWrite<AccountId = AccountUuid, Error = SqliteClientError>,
+    DbT: WalletRead<AccountId = AccountUuid, Error = SqliteClientError> + WalletWrite,
     P: consensus::Parameters,
     S: std::error::Error,
 {
@@ -1031,7 +1070,6 @@ where
         NetworkType::Main => 0x80,
         NetworkType::Test | NetworkType::Regtest => 0xEF,
     };
-    let secp = secp256k1::Secp256k1::new();
 
     for entry in store.map_or(&[][..], |s| s.transparent_keys()) {
         if !entry.pubkey().is_compressed() {
@@ -1052,7 +1090,7 @@ where
                     address: address.clone(),
                 }
             })?;
-        if secret_key.public_key(&secp) != pubkey {
+        if secret_key.public_key() != pubkey {
             return Err(ZewifImportError::TransparentKeyMismatch { address });
         }
 
@@ -1072,7 +1110,6 @@ where
     }
 
     for (account_uuid, script_bytes) in &taddrs.redeem_scripts {
-        use zcash_script::script::{Code, Redeem};
         let parsed = Redeem::parse(&Code(script_bytes.clone()));
         match parsed {
             Ok(redeem) => {
@@ -1103,7 +1140,7 @@ fn exposed_receivers<DbT, S>(
     accounts: &std::collections::HashSet<AccountUuid>,
 ) -> Result<std::collections::HashSet<TransparentAddress>, ZewifImportError<S>>
 where
-    DbT: WalletWrite<AccountId = AccountUuid, Error = SqliteClientError>,
+    DbT: WalletRead<AccountId = AccountUuid, Error = SqliteClientError> + WalletWrite,
     S: std::error::Error,
 {
     let mut exposed = std::collections::HashSet::new();
@@ -1159,7 +1196,7 @@ fn mark_addresses_exposed<DbT, P, S>(
     report: &mut ZewifImportReport,
 ) -> Result<(), ZewifImportError<S>>
 where
-    DbT: WalletWrite<AccountId = AccountUuid, Error = SqliteClientError>,
+    DbT: WalletRead<AccountId = AccountUuid, Error = SqliteClientError> + WalletWrite,
     P: consensus::Parameters,
     S: std::error::Error,
 {
@@ -1290,9 +1327,10 @@ where
 /// [`decrypt_and_store_transaction`] stores a transaction only when trial
 /// decryption or transparent-output matching shows wallet involvement, so the
 /// count of stored transactions is determined by querying for each transaction
-/// id after the attempt. Storage additionally requires a known chain tip, which
-/// only an imported account establishes; if none was imported, every
-/// transaction is deferred to the post-import rescan.
+/// id after the attempt. Storage additionally requires a known chain tip;
+/// [`import_wallet`] establishes one from the document whenever at least one
+/// account was imported, so only a document from which no account could be
+/// imported has every transaction deferred to the post-import rescan.
 fn import_transactions<DbT, P, S>(
     wdb: &mut DbT,
     params: &P,
@@ -1300,7 +1338,7 @@ fn import_transactions<DbT, P, S>(
     report: &mut ZewifImportReport,
 ) -> Result<(), ZewifImportError<S>>
 where
-    DbT: WalletWrite<AccountId = AccountUuid, Error = SqliteClientError>,
+    DbT: WalletRead<AccountId = AccountUuid, Error = SqliteClientError> + WalletWrite,
     P: consensus::Parameters,
     S: std::error::Error,
 {
@@ -1344,7 +1382,7 @@ where
         if !chain_tip_known {
             // No chain tip against which to store the transaction; defer it to
             // the post-import rescan.
-            report.transactions_without_wallet_relevance += 1;
+            report.transactions_deferred_no_chain_tip += 1;
             continue;
         }
         let recorded_txid = zcash_protocol::TxId::from_bytes(*tx.txid().as_bytes());
@@ -1399,7 +1437,7 @@ fn import_account<DbT, P, S>(
     report: &mut ZewifImportReport,
 ) -> Result<(), ZewifImportError<S>>
 where
-    DbT: WalletWrite<AccountId = AccountUuid, Error = SqliteClientError>,
+    DbT: WalletRead<AccountId = AccountUuid, Error = SqliteClientError> + WalletWrite,
     P: consensus::Parameters,
     S: std::error::Error,
 {
@@ -1449,10 +1487,10 @@ where
         match account.viewing_key() {
             ::zewif::AccountViewingKey::Ufvk(ufvk) => {
                 let decoded =
-                    UnifiedFullViewingKey::decode(params, ufvk.encoding()).map_err(|message| {
+                    UnifiedFullViewingKey::decode(params, ufvk.encoding()).map_err(|e| {
                         ZewifImportError::UfvkDecoding {
                             account_name: account.name().to_owned(),
-                            message,
+                            message: e.to_string(),
                         }
                     })?;
                 let purpose = account_purpose(
@@ -1467,9 +1505,9 @@ where
             }
             ::zewif::AccountViewingKey::SaplingExtFvk(efvk) => {
                 let decoded = zcash_keys::encoding::decode_extended_full_viewing_key(
-                    params
-                        .network_type()
-                        .hrp_sapling_extended_full_viewing_key(),
+                    zcash_keys::constants::hrp_sapling_extended_full_viewing_key(
+                        params.network_type(),
+                    ),
                     efvk.encoding(),
                 )
                 .map_err(|_| ZewifImportError::SaplingFvkDecoding {
@@ -1578,7 +1616,7 @@ fn ufvk_components_consistent(
     derived: &UnifiedFullViewingKey,
     recorded: &UnifiedFullViewingKey,
 ) -> bool {
-    let transparent_ok = match (derived.transparent(), recorded.transparent()) {
+    let transparent_ok = match (derived.p2pkh(), recorded.p2pkh()) {
         (Some(a), Some(b)) => a.serialize() == b.serialize(),
         _ => true,
     };
@@ -1603,10 +1641,10 @@ fn verify_hd_derivation<P: Parameters, S>(
     seed: &SecretVec<u8>,
     account_index: zip32::AccountId,
 ) -> Result<(), ZewifImportError<S>> {
-    let recorded = UnifiedFullViewingKey::decode(params, ufvk.encoding()).map_err(|message| {
+    let recorded = UnifiedFullViewingKey::decode(params, ufvk.encoding()).map_err(|e| {
         ZewifImportError::UfvkDecoding {
             account_name: account_name.to_owned(),
-            message,
+            message: e.to_string(),
         }
     })?;
     let derived = UnifiedSpendingKey::from_seed(params, seed.expose_secret(), account_index)
@@ -1625,21 +1663,33 @@ fn verify_hd_derivation<P: Parameters, S>(
 
 #[cfg(test)]
 mod tests {
-    use ::transparent::keys::{IncomingViewingKey as _, NonHardenedChildIndex};
+    use ::transparent::{
+        address::Script,
+        bundle as transparent,
+        bundle::{Authorized, OutPoint, TxIn, TxOut},
+        keys::{IncomingViewingKey, NonHardenedChildIndex},
+    };
     use bip0039::{English, Mnemonic};
     use incrementalmerkletree::Hashable as _;
     use std::collections::BTreeMap;
     use tempfile::NamedTempFile;
-    use zcash_client_backend::data_api::{Account as _, AccountPurpose, AccountSource, WalletRead};
-    use zcash_keys::encoding::AddressCodec;
-    use zcash_keys::keys::{UnifiedFullViewingKey, UnifiedSpendingKey};
-    use zcash_protocol::consensus;
-    use zcash_protocol::local_consensus::LocalNetwork;
+    use zcash_client_backend::{
+        data_api::{AccountPurpose, AccountSource, WalletRead},
+        wallet::Exposure,
+    };
+    use zcash_keys::{
+        encoding::AddressCodec,
+        keys::{UnifiedFullViewingKey, UnifiedSpendingKey},
+    };
+    use zcash_protocol::{consensus, local_consensus::LocalNetwork, value::Zatoshis};
     use zip32::fingerprint::SeedFingerprint;
 
     use super::*;
-    use crate::testing::db::{test_clock, test_rng};
-    use crate::wallet::init::WalletMigrator;
+    use crate::{
+        testing::db::{test_clock, test_rng},
+        wallet::init::WalletMigrator,
+    };
+    use zcash_primitives::transaction::{TransactionData, TxVersion};
 
     const TEST_NETWORK: consensus::Network = consensus::Network::TestNetwork;
 
@@ -1724,9 +1774,11 @@ mod tests {
             nu6_1: one,
             nu6_2: one,
             nu6_3: one,
-            nu7: None,
             zsa: one,
             orchard_mode: zcash_protocol::consensus::OrchardMode::Normal,
+            nu7: one,
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: None,
         }
     }
 
@@ -1918,7 +1970,7 @@ mod tests {
         let ts = test_seed(0);
 
         let mut account = ::zewif::Account::new(::zewif::AccountViewingKey::Ufvk(
-            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK)),
+            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK).unwrap()),
         ));
         account.set_name("viewing");
         account.set_birthday_height(::zewif::BlockHeight::from(2_600_000));
@@ -1973,7 +2025,7 @@ mod tests {
         store.add_seed(seed_entry(&ts));
 
         let mut account = ::zewif::Account::new(::zewif::AccountViewingKey::Ufvk(
-            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK)),
+            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK).unwrap()),
         ));
         account.set_name("derived");
         account.set_birthday_height(::zewif::BlockHeight::from(2_600_000));
@@ -2018,9 +2070,10 @@ mod tests {
         }
         // The account's UFVK is re-derived from the seed and matches the
         // document's record of it.
-        assert_eq!(
-            imported.ufvk().map(|k| k.encode(&TEST_NETWORK)),
-            Some(ts.ufvk.encode(&TEST_NETWORK)),
+        assert!(
+            imported
+                .ufvk()
+                .is_some_and(|k| k.is_equivalent_to(&ts.ufvk))
         );
     }
 
@@ -2050,11 +2103,10 @@ mod tests {
         let (_file, mut wdb) = test_wallet_db();
         let ts = test_seed(0);
 
-        let secp = secp256k1::Secp256k1::new();
-        let secret_key = secp256k1::SecretKey::from_slice(&[0x42; 32]).unwrap();
-        let pubkey = secret_key.public_key(&secp);
+        let secret_key = secp256k1::SecretKey::from_secret_bytes([0x42; 32]).unwrap();
+        let pubkey = secret_key.public_key();
         let mut wif_payload = vec![0xEF];
-        wif_payload.extend_from_slice(&secret_key.secret_bytes());
+        wif_payload.extend_from_slice(&secret_key.to_secret_bytes());
         wif_payload.push(0x01);
         let wif = bs58::encode(wif_payload).with_check().into_string();
 
@@ -2100,12 +2152,11 @@ mod tests {
         let (_file, mut wdb) = test_wallet_db();
         let ts = test_seed(0);
 
-        let secp = secp256k1::Secp256k1::new();
-        let secret_key = secp256k1::SecretKey::from_slice(&[0x42; 32]).unwrap();
-        let pubkey = secret_key.public_key(&secp);
+        let secret_key = secp256k1::SecretKey::from_secret_bytes([0x42; 32]).unwrap();
+        let pubkey = secret_key.public_key();
         let address = TransparentAddress::from_pubkey(&pubkey).encode(&TEST_NETWORK);
         let mut wif_payload = vec![0xEF];
-        wif_payload.extend_from_slice(&secret_key.secret_bytes());
+        wif_payload.extend_from_slice(&secret_key.to_secret_bytes());
         wif_payload.push(0x01);
         let wif = bs58::encode(wif_payload).with_check().into_string();
 
@@ -2161,12 +2212,11 @@ mod tests {
         let (_file, mut wdb) = test_wallet_db();
         let ts = test_seed(0);
 
-        let secp = secp256k1::Secp256k1::new();
-        let secret_key = secp256k1::SecretKey::from_slice(&[0x42; 32]).unwrap();
-        let pubkey = secret_key.public_key(&secp);
+        let secret_key = secp256k1::SecretKey::from_secret_bytes([0x42; 32]).unwrap();
+        let pubkey = secret_key.public_key();
         let address = TransparentAddress::from_pubkey(&pubkey).encode(&TEST_NETWORK);
         let mut wif_payload = vec![0xEF];
-        wif_payload.extend_from_slice(&secret_key.secret_bytes());
+        wif_payload.extend_from_slice(&secret_key.to_secret_bytes());
         wif_payload.push(0x01);
         let wif = bs58::encode(wif_payload).with_check().into_string();
 
@@ -2229,7 +2279,7 @@ mod tests {
 
         let external_ivk = ts
             .ufvk
-            .transparent()
+            .p2pkh()
             .expect("the test UFVK has a transparent component")
             .derive_external_ivk()
             .unwrap();
@@ -2326,7 +2376,7 @@ mod tests {
         account_index: u32,
     ) -> ::zewif::Account {
         let mut account = ::zewif::Account::new(::zewif::AccountViewingKey::Ufvk(
-            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK)),
+            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK).unwrap()),
         ));
         account.set_name("hd");
         account.set_birthday_height(::zewif::BlockHeight::from(2_600_000));
@@ -2401,12 +2451,12 @@ mod tests {
         // imported as spending rather than view-only.
         let mut store = ::zewif::SecretStore::new();
         store.add_unified_key(::zewif::UnifiedKeyEntry::new(
-            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK)),
+            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK).unwrap()),
             ::zewif::UnifiedSpendingKey::new("usk1testspendingkey"),
         ));
 
         let mut account = ::zewif::Account::new(::zewif::AccountViewingKey::Ufvk(
-            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK)),
+            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK).unwrap()),
         ));
         account.set_name("spending");
         account.set_birthday_height(::zewif::BlockHeight::from(2_600_000));
@@ -2440,11 +2490,6 @@ mod tests {
         value: u64,
         height: u32,
     ) -> (zcash_protocol::TxId, Vec<u8>) {
-        use ::transparent::address::Script;
-        use ::transparent::bundle::{self as transparent, Authorized, OutPoint, TxIn, TxOut};
-        use zcash_primitives::transaction::{TransactionData, TxVersion};
-        use zcash_protocol::value::Zatoshis;
-
         let height = consensus::BlockHeight::from(height);
         let tx = TransactionData::from_parts(
             TxVersion::V5,
@@ -2479,11 +2524,6 @@ mod tests {
         outputs: &[(&TransparentAddress, u64)],
         height: u32,
     ) -> (zcash_protocol::TxId, Vec<u8>) {
-        use ::transparent::address::Script;
-        use ::transparent::bundle::{self as transparent, Authorized, OutPoint, TxIn, TxOut};
-        use zcash_primitives::transaction::{TransactionData, TxVersion};
-        use zcash_protocol::value::Zatoshis;
-
         let height = consensus::BlockHeight::from(height);
         let tx = TransactionData::from_parts(
             TxVersion::V5,
@@ -2606,7 +2646,6 @@ mod tests {
         assert_eq!(report.addresses_never_exposed, 0);
         // ...and it is exposed (at the transaction's mined height) via the
         // transaction-import path.
-        use zcash_client_backend::wallet::Exposure;
         let receivers = wdb
             .get_transparent_receivers(report.imported_accounts[0].account_uuid, true, true)
             .unwrap();
@@ -2634,7 +2673,6 @@ mod tests {
             UnifiedSpendingKey::from_seed(&TEST_NETWORK, &seed, zip32::AccountId::ZERO).unwrap();
 
         // The account's internal (change) transparent address.
-        use ::transparent::keys::{IncomingViewingKey, NonHardenedChildIndex};
         let change_addr = usk
             .transparent()
             .to_account_pubkey()
@@ -2669,7 +2707,6 @@ mod tests {
 
         // The internal-scope change address is exposed at the transaction's
         // mined height.
-        use zcash_client_backend::wallet::Exposure;
         let receivers = wdb
             .get_transparent_receivers(report.imported_accounts[0].account_uuid, true, true)
             .unwrap();
@@ -2713,8 +2750,122 @@ mod tests {
 
         assert!(report.imported_accounts.is_empty());
         assert_eq!(report.transactions_stored, 0);
-        assert_eq!(report.transactions_without_wallet_relevance, 1);
+        assert_eq!(report.transactions_without_wallet_relevance, 0);
+        assert_eq!(report.transactions_deferred_no_chain_tip, 1);
         assert_eq!(report.transactions_without_raw_data, 0);
+    }
+
+    /// Builds an unmined transparent-only v5 transaction with a zero expiry
+    /// height (never expiring, as for a coinbase transaction), under the
+    /// consensus rules in force at `height`.
+    fn transparent_zero_expiry_tx_to<P: consensus::Parameters>(
+        params: &P,
+        to: &TransparentAddress,
+        value: u64,
+        height: u32,
+    ) -> (zcash_protocol::TxId, Vec<u8>) {
+        let height = consensus::BlockHeight::from(height);
+        let tx = TransactionData::from_parts(
+            TxVersion::V5,
+            BranchId::for_height(params, height),
+            0,
+            consensus::BlockHeight::from(0),
+            #[cfg(feature = "zip-233")]
+            zcash_protocol::value::Zatoshis::ZERO,
+            Some(transparent::Bundle {
+                vin: vec![TxIn::from_parts(OutPoint::fake(), Script::default(), 0)],
+                vout: vec![TxOut::new(
+                    Zatoshis::const_from_u64(value),
+                    to.script().into(),
+                )],
+                authorization: Authorized,
+            }),
+            None,
+            None,
+            None,
+        )
+        .freeze()
+        .unwrap();
+
+        let mut bytes = vec![];
+        tx.write(&mut bytes).unwrap();
+        (tx.txid(), bytes)
+    }
+
+    /// A document whose only account has a birthday at Sapling activation (as
+    /// for a pre-Sapling zcashd wallet) establishes no chain tip as a side
+    /// effect of account import; the importer must seed one from the document
+    /// so that the document's transactions — including unmined transactions
+    /// with a zero expiry height, such as coinbase transactions recorded
+    /// before any chain scan — are stored rather than deferred.
+    #[test]
+    fn pre_sapling_birthday_document_stores_unmined_zero_expiry_transaction() {
+        let (_file, mut wdb) = regtest_wallet_db();
+        let params = regtest_local_network();
+
+        let mnemonic = <Mnemonic<English>>::from_entropy([0xAB; 32]).unwrap();
+        let seed = mnemonic.to_seed("");
+        let fp = SeedFingerprint::from_seed(&seed).unwrap();
+        let fingerprint_encoding = encode_seed_fp(&fp);
+        let usk = UnifiedSpendingKey::from_seed(&params, &seed, zip32::AccountId::ZERO).unwrap();
+        let (taddr, _) = usk.default_transparent_address();
+
+        let (txid, raw) = transparent_zero_expiry_tx_to(&params, &taddr, 100_000, 100);
+
+        let mut store = ::zewif::SecretStore::new();
+        store.add_seed(::zewif::SeedEntry::new(
+            ::zewif::SeedFingerprint::new(fingerprint_encoding.clone()),
+            ::zewif::SeedMaterial::Bip39Mnemonic(::zewif::Bip39Mnemonic::new(
+                mnemonic.phrase(),
+                None,
+            )),
+        ));
+
+        let mut account = ::zewif::Account::new(::zewif::AccountViewingKey::Ufvk(
+            ::zewif::UnifiedFullViewingKey::new(
+                usk.to_unified_full_viewing_key().encode(&params).unwrap(),
+            ),
+        ));
+        account.set_name("pre-sapling");
+        // A birthday at Sapling activation (height 1 on regtest) writes no
+        // scan queue entries as a side effect of account import.
+        account.set_birthday_height(::zewif::BlockHeight::from(1));
+        account.set_key_source(::zewif::KeySource::Derived(::zewif::DerivedKeySource::new(
+            ::zewif::SeedFingerprint::new(fingerprint_encoding),
+            0,
+            None,
+        )));
+
+        let mut doc = ::zewif::Zewif::new(
+            ::zewif::BlockHeight::from(100),
+            ::zewif::BlockHash::from_bytes([0xEE; 32]),
+        );
+        let mut wallet = ::zewif::ZewifWallet::new(regtest_network(BTreeMap::new()));
+        wallet.add_account(account);
+        doc.add_wallet(wallet);
+        doc.set_secrets(::zewif::Secrets::Plain(store));
+
+        let mut tx = ::zewif::Transaction::new(::zewif::TxId::from_bytes(*txid.as_ref()));
+        tx.set_tx_data(::zewif::TransactionData::Raw(::zewif::RawTxData::new(
+            ::zewif::Data::from_bytes(&raw),
+        )));
+        doc.add_transaction(tx.txid(), tx);
+
+        let report = import_wallet(&mut wdb, &doc, &mut RecordingSink::default()).unwrap();
+
+        assert_eq!(report.imported_accounts.len(), 1);
+        assert_eq!(report.transactions_stored, 1);
+        assert_eq!(report.transactions_deferred_no_chain_tip, 0);
+        assert_eq!(report.transactions_without_wallet_relevance, 0);
+
+        // The stored transaction can be read back despite being unmined with a
+        // zero expiry height.
+        let stored = wdb
+            .get_transaction(txid)
+            .unwrap()
+            .expect("transaction was stored");
+        assert_eq!(stored.txid(), txid);
+        assert_eq!(stored.expiry_height(), consensus::BlockHeight::from(0));
     }
 
     #[test]
@@ -2727,7 +2878,7 @@ mod tests {
         // aborts the import; the whole import must roll back, leaving nothing
         // committed.
         let mut account = ::zewif::Account::new(::zewif::AccountViewingKey::Ufvk(
-            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK)),
+            ::zewif::UnifiedFullViewingKey::new(ts.ufvk.encode(&TEST_NETWORK).unwrap()),
         ));
         account.set_name("viewing");
         account.set_birthday_height(::zewif::BlockHeight::from(2_600_000));

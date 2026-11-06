@@ -8,7 +8,7 @@
 //! shielded internal address belonging to their wallet.
 //!
 //! The important high-level operations provided by this module are [`propose_transfer`],
-//! [`create_proposed_transactions`], and [`create_proposed_transactions_detached`].
+//! and [`create_proposed_transactions`].
 //!
 //! [`propose_transfer`] takes a [`TransactionRequest`] object, selects inputs notes and
 //! computes the fees required to satisfy that request, and returns a [`Proposal`] object that
@@ -20,10 +20,6 @@
 //! [`WalletRead::get_transaction`] method to retrieve the newly constructed transactions. It is
 //! the responsibility of the caller to retrieve and serialize the transactions and submit them for
 //! inclusion into the Zcash blockchain.
-//!
-//! [`create_proposed_transactions_detached`] constructs and returns one or more signed Zcash
-//! [`Transaction`]s without storing them as pending sent transactions in the wallet database.
-//! This is intended for sign-only workflows where another device will submit the transactions.
 //!
 #![cfg_attr(
     feature = "transparent-inputs",
@@ -39,20 +35,22 @@ to a wallet-internal shielded address, as described in [ZIP 316](https://zips.z.
 //! [`propose_transfer`]: crate::data_api::wallet::propose_transfer
 
 use nonempty::NonEmpty;
-use rand_core::OsRng;
+use rand_core::CryptoRng;
 use std::{
     num::NonZeroU32,
     ops::{Add, Sub},
+    time::SystemTime,
 };
 
 use shardtree::error::{QueryError, ShardTreeError};
 
-use super::InputSource;
+pub use super::locking::{LockRequest, unlock_proposal_inputs};
+use super::{InputSource, locking::lock_proposal_inputs};
 use crate::{
     data_api::{
         Account, MaxSpendMode, NoteCommitmentTree, SentTransaction, SentTransactionOutput,
         WalletCommitmentTrees, WalletRead, WalletWrite,
-        error::{Error, LockError},
+        error::{AddressExpiryError, Error},
         wallet::input_selection::propose_send_max,
     },
     decrypt_transaction,
@@ -60,7 +58,8 @@ use crate::{
         ChangeStrategy, DustOutputPolicy, StandardFeeRule, standard::SingleOutputChangeStrategy,
     },
     proposal::{Proposal, ProposalError, Step, StepOutputIndex},
-    wallet::{LockOwner, Note, OutputRef, OvkPolicy, Recipient},
+    util::Clock,
+    wallet::{Note, OvkPolicy, Recipient},
 };
 use sapling::{
     note_encryption::{PreparedIncomingViewingKey, try_sapling_note_decryption},
@@ -69,11 +68,11 @@ use sapling::{
 use transparent::{address::TransparentAddress, builder::TransparentSigningSet, bundle::OutPoint};
 use zcash_address::ZcashAddress;
 use zcash_keys::{
-    address::Address,
+    address::{Address, UnifiedAddress},
     keys::{UnifiedFullViewingKey, UnifiedSpendingKey},
 };
 use zcash_primitives::transaction::{
-    Transaction, TxId,
+    Transaction, TxId, TxVersion,
     builder::{BuildConfig, BuildResult, Builder, BundlePadding},
     components::sapling::zip212_enforcement,
     fees::FeeRule,
@@ -83,9 +82,15 @@ use zcash_protocol::{
     consensus::{self, BlockHeight},
     memo::MemoBytes,
     value::Zatoshis,
+    zip318::AnchorGrid,
 };
 use zip32::Scope;
 use zip321::Payment;
+#[cfg(feature = "orchard")]
+use {
+    crate::data_api::anchor_retention::PoolMigrationParams,
+    zcash_protocol::{consensus::NetworkUpgrade, zip318::PoolMigrationConstants},
+};
 
 #[cfg(feature = "transparent-inputs")]
 use {
@@ -101,9 +106,6 @@ use {
     transparent::bundle::TxOut,
 };
 
-#[cfg(feature = "orchard")]
-use zcash_protocol::consensus::NetworkUpgrade;
-
 #[cfg(feature = "transparent-key-import")]
 use zcash_script::script::{self as zs_script, Evaluable};
 
@@ -111,22 +113,21 @@ use zcash_script::script::{self as zs_script, Evaluable};
 use {
     crate::data_api::error::PcztError,
     bip32::ChildNumber,
-    orchard::note_encryption::OrchardDomain,
+    orchard::note_encryption::{IronwoodDomain, OrchardDomain},
     pczt::roles::{
         creator::Creator, io_finalizer::IoFinalizer, redactor::Redactor,
         spend_finalizer::SpendFinalizer, tx_extractor::TransactionExtractor, updater::Updater,
     },
     sapling::note_encryption::SaplingDomain,
     serde::{Deserialize, Serialize},
+    std::collections::BTreeMap,
     transparent::pczt::Bip32Derivation,
-    zcash_note_encryption::try_output_recovery_with_pkd_esk,
+    zcash_note_encryption::{Domain, ShieldedOutput, try_output_recovery_with_pkd_esk},
     zcash_protocol::{consensus::NetworkConstants, value::BalanceError},
 };
 
 #[cfg(all(feature = "pczt", feature = "zsa"))]
 use orchard::zsa::OrchardZSADomain;
-
-use zcash_primitives::transaction::TxVersion;
 
 pub mod input_selection;
 use input_selection::{
@@ -254,7 +255,7 @@ pub fn decrypt_and_store_transaction<ParamsT, DbT>(
     data: &mut DbT,
     tx: &Transaction,
     mined_height: Option<BlockHeight>,
-) -> Result<(), DbT::Error>
+) -> Result<(), <DbT as WalletRead>::Error>
 where
     ParamsT: consensus::Parameters,
     DbT: WalletWrite,
@@ -583,6 +584,68 @@ impl ConfirmationsPolicy {
         target_height.saturating_sub(u32::from(self.trusted()))
     }
 
+    /// Returns this policy adjusted so that the shielded anchor for `target_height` lands on a
+    /// boundary of `grid`, or `None` if no boundary is reachable.
+    ///
+    /// A [ZIP 318] pool crossing is proved against a boundary block rather than the chain tip, so
+    /// that many wallets' crossings share a small set of anchors instead of each pinning a unique
+    /// recent block.
+    ///
+    /// Bucketing is expressed as a RAISED CONFIRMATION REQUIREMENT rather than as a separately
+    /// lowered anchor, because the anchor and the bound on which notes may be spent are the same
+    /// quantity: `target_height` less the required confirmations. Moving that one number moves
+    /// both together, which is what makes it impossible to select a note having no witness at the
+    /// bucketed anchor. Lowering the anchor on its own would leave two numbers free to drift.
+    ///
+    /// The untrusted requirement is raised to match when it would otherwise fall below the trusted
+    /// one, preserving this type's `trusted <= untrusted` invariant.
+    ///
+    /// The boundary chosen is the one BEFORE the most recent one — an anchor age of 1, the
+    /// smallest ZIP 318 admits. Anchoring to the most recent boundary would be an age of 0, which
+    /// no migration transfer uses.
+    ///
+    /// `activation_height` is the activation of the pool being crossed into; the chosen boundary
+    /// must lie strictly above it.
+    ///
+    /// Returns `None` when no usable boundary is reachable: when the ordinary anchor lies below the
+    /// first boundary after `activation_height`, or where the required confirmations would reach
+    /// back past the genesis block. Reporting that as "unable to bucket" is what lets a caller fall
+    /// back, rather than build a proposal that is bound to fail.
+    ///
+    /// [ZIP 318]: https://zips.z.cash/zip-0318
+    pub fn bucketed(
+        &self,
+        grid: AnchorGrid,
+        target_height: TargetHeight,
+        activation_height: BlockHeight,
+    ) -> Option<Self> {
+        // ZIP 318 draws an anchor of AGE `a` in `[1, ANCHOR_AGE_CAP]` boundaries behind the most
+        // recent one, so the chosen boundary is always strictly below it. Age 1 is taken here: the
+        // newest admissible boundary, and the modal age under the migration's `Geometric(1/2)`
+        // draw. Anchoring to the most recent boundary instead would be an age of 0, which no
+        // migration transfer ever uses.
+        let most_recent = grid.boundary_at_or_below(self.anchor_height(target_height));
+        let boundary = grid.boundary_before(most_recent)?;
+
+        // The boundary must lie strictly above the activation of the pool being crossed into.
+        // Rounding down can otherwise land on a PRE-ACTIVATION boundary in the window between
+        // activation and the first boundary after it, and ZIP 318's candidate set contains no such
+        // height — anchoring there would be distinguishable rather than shared. Height zero is
+        // excluded by the same bound, its note commitment tree being empty.
+        if boundary <= activation_height {
+            return None;
+        }
+        let bucketed = u32::from(target_height).checked_sub(u32::from(boundary))?;
+        let trusted = NonZeroU32::new(bucketed)?;
+        Self::new(
+            trusted,
+            core::cmp::max(self.untrusted(), trusted),
+            #[cfg(feature = "transparent-inputs")]
+            self.allow_zero_conf_shielding(),
+        )
+        .ok()
+    }
+
     /// Returns whether or not transparent inputs may be spent with zero confirmations in shielding
     /// transactions.
     #[cfg(feature = "transparent-inputs")]
@@ -675,125 +738,12 @@ impl ConfirmationsPolicy {
     }
 }
 
-/// Returns the [`OutputRef`] identifying each output that the given proposal consumes as an
-/// input.
-///
-/// Each note or UTXO selected for spending is an *input* to the proposal's transaction, but is at
-/// the same time an *output* of the earlier transaction that created it; an [`OutputRef`] names it
-/// by that creating transaction's id, which is the stable identity the lock tables are keyed on.
-fn proposal_input_refs<FeeRuleT, NoteRef>(
-    proposal: &Proposal<FeeRuleT, NoteRef>,
-) -> Vec<OutputRef> {
-    proposal
-        .steps()
-        .iter()
-        .flat_map(|step| {
-            step.shielded_inputs()
-                .into_iter()
-                .flat_map(|shielded_inputs| {
-                    shielded_inputs.notes().iter().map(|note| {
-                        OutputRef::new(
-                            *note.txid(),
-                            PoolType::Shielded(note.note().pool()),
-                            u32::from(note.output_index()),
-                        )
-                    })
-                })
-                .chain(step.transparent_inputs().iter().map(|utxo| {
-                    let outpoint = utxo.outpoint();
-                    OutputRef::new(
-                        TxId::from_bytes(*outpoint.hash()),
-                        PoolType::TRANSPARENT,
-                        outpoint.n(),
-                    )
-                }))
-        })
-        .collect()
-}
-
-/// A request to lock the inputs selected by a proposal, made when calling one of the
-/// proposal-creation functions ([`propose_transfer`] and friends).
-///
-/// The caller supplies the [`LockOwner`] under which the locks are taken and must retain it: the
-/// owner token is what authorizes releasing the locks with [`unlock_proposal_inputs`], and what
-/// allows the same flow to re-lock its own inputs when retrying after a crash.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LockRequest {
-    owner: LockOwner,
-    for_blocks: u32,
-}
-
-impl LockRequest {
-    /// Constructs a request to lock the proposal's inputs on behalf of `owner` until
-    /// `for_blocks` blocks past the proposal's target height.
-    ///
-    /// Choose `for_blocks` conservatively with respect to the worst-case time between proposal
-    /// creation and transaction storage: once the lock expires, a concurrent proposal may
-    /// select the same inputs.
-    pub fn new(owner: LockOwner, for_blocks: u32) -> Self {
-        Self { owner, for_blocks }
-    }
-
-    /// Returns the owner under which the locks will be taken.
-    pub fn owner(&self) -> LockOwner {
-        self.owner
-    }
-
-    /// Returns the number of blocks past the proposal's target height at which the locks will
-    /// expire.
-    pub fn for_blocks(&self) -> u32 {
-        self.for_blocks
-    }
-}
-
-/// Locks all inputs selected by the given proposal, preventing them from being
-/// selected by subsequent proposals. The lock expires at the given height.
-#[allow(clippy::type_complexity)]
-fn lock_proposal_inputs<DbT, FeeRuleT, NoteRef, TE, SE, FE, CE>(
-    wallet_db: &mut DbT,
-    proposal: &Proposal<FeeRuleT, NoteRef>,
-    owner: LockOwner,
-    lock_expiry_height: BlockHeight,
-) -> Result<(), Error<DbT::Error, TE, SE, FE, CE, NoteRef>>
-where
-    DbT: WalletWrite,
-{
-    match wallet_db.lock_outputs(&proposal_input_refs(proposal), owner, lock_expiry_height) {
-        Ok(_) => Ok(()),
-        Err(LockError::LockFailure(out_ref)) => {
-            Err(Error::Proposal(ProposalError::InputsLocked(out_ref)))
-        }
-        Err(LockError::Storage(e)) => Err(Error::DataSource(e)),
-    }
-}
-
-/// Unlocks all inputs selected by the given proposal, reversing the locks acquired when the
-/// proposal was created with a [`LockRequest`] under the same `owner`.
-///
-/// This is useful when a proposal is rejected or abandoned after its inputs were locked, so that
-/// the outputs become available for selection and balance computation once again. Because
-/// unlocking is scoped to `owner`, inputs that are not locked, or whose locks are held by a
-/// different owner (for example a concurrently-created proposal), are left unchanged.
-pub fn unlock_proposal_inputs<DbT, FeeRuleT, NoteRef>(
-    wallet_db: &mut DbT,
-    proposal: &Proposal<FeeRuleT, NoteRef>,
-    owner: LockOwner,
-) -> Result<(), DbT::Error>
-where
-    DbT: WalletWrite,
-{
-    for output_ref in proposal_input_refs(proposal) {
-        wallet_db.unlock_output(&output_ref, owner)?;
-    }
-    Ok(())
-}
-
 /// Select transaction inputs, compute fees, and construct a proposal for a transaction or series
 /// of transactions that can then be authorized and made ready for submission to the network with
 /// [`create_proposed_transactions`].
 ///
 /// When `lock_inputs` is `Some(request)`, every input selected by the returned proposal is
-/// locked via [`WalletWrite::lock_outputs`] on behalf of the request's [`LockOwner`], with an
+/// locked via [`OutputLockStore::lock_outputs`] on behalf of the request's [`LockOwner`], with an
 /// expiry height of `target_height + request.for_blocks()`, so that the inputs are excluded from
 /// selection by subsequent proposals until that height is reached (or until they are explicitly
 /// released; see below). When it is `None`, no locking is performed.
@@ -813,16 +763,17 @@ where
 /// whose inputs it locked should release them with [`unlock_proposal_inputs`] under the same
 /// owner; locks are otherwise cleared automatically when the inputs are recorded as spent by
 /// [`WalletWrite::store_transactions_to_be_sent`], when their expiry height is reached, or via
-/// [`WalletWrite::clear_locked_outputs`].
+/// [`OutputLockStore::clear_locked_outputs`].
 ///
 /// Note that expiry re-opens the race the lock exists to prevent: if building and proving the
 /// transaction takes longer than the requested lock window, the lock expires and a concurrent
 /// proposal may select and spend the same inputs. Choose the window conservatively with respect
 /// to the worst-case time between proposal creation and transaction storage.
 ///
-/// [`WalletWrite::lock_outputs`]: crate::data_api::WalletWrite::lock_outputs
+/// [`LockOwner`]: crate::wallet::LockOwner
+/// [`OutputLockStore::lock_outputs`]: crate::data_api::OutputLockStore::lock_outputs
 /// [`WalletWrite::store_transactions_to_be_sent`]: crate::data_api::WalletWrite::store_transactions_to_be_sent
-/// [`WalletWrite::clear_locked_outputs`]: crate::data_api::WalletWrite::clear_locked_outputs
+/// [`OutputLockStore::clear_locked_outputs`]: crate::data_api::OutputLockStore::clear_locked_outputs
 /// [zcash/librustzcash#2161]: https://github.com/zcash/librustzcash/issues/2161
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
@@ -858,18 +809,139 @@ where
     let (target_height, anchor_height) =
         maybe_intial_heights.ok_or_else(|| InputSelectorError::SyncRequired)?;
 
-    let proposal = input_selector.propose_transaction(
-        params,
-        wallet_db,
-        target_height,
-        anchor_height,
-        confirmations_policy,
-        spend_from_account,
-        request,
-        change_strategy,
-        spend_policy,
-        proposed_version,
-    )?;
+    // The ZIP 318 parameters in force for THIS wallet. The anchor bucket grid must come from the
+    // wallet rather than the network defaults: the wallet is the side that retains the
+    // checkpoints, so its grid is the only one a crossing can actually be proved against, and
+    // every decision below that depends on the grid consults this one value.
+    let zip318 = wallet_db.pool_migration_params(params);
+
+    // A payment of a canonical ZIP 318 denomination across the Orchard turnstile is proposed
+    // against a BUCKETED anchor and funded from a single Orchard note, so that the resulting
+    // transaction is indistinguishable from a ZIP 318 migration transfer (see
+    // `Step::is_canonical_crossing`). Whether that is achievable is decided here, before any
+    // proposal is kept, rather than discovered by failure: the common miss is not insufficient
+    // funds but a SUCCESSFUL multi-note selection, which funds perfectly well yet is not a
+    // canonical crossing. Falling back only on insufficient funds would leave such a transaction
+    // carrying a bucketed anchor — up to one interval of extra confirmations on its inputs — while
+    // still being built padded, which is worse than never having tried.
+    //
+    // Selection is restricted to the Orchard pool for the attempt. That is not merely a
+    // preference: a canonical crossing admits no Ironwood spends, and the ordinary selector
+    // prefers to avoid crossing pools, so for an Ironwood-destined payment it reaches for Ironwood
+    // notes whenever the wallet holds them. Without the restriction, a user migrating their own
+    // funds by sending themselves canonical amounts would stall as soon as the first crossing
+    // produced Ironwood notes: every later payment would be funded from Ironwood, crossing
+    // nothing, and no further value would ever leave the Orchard pool.
+    //
+    // The canonical fee for the shape, under the parameters and target height this transaction
+    // will actually be built against. The STANDARD ZIP 317 rule is asked, not the caller's: a
+    // proposal built on a fixed non-standard rule would otherwise be compared against its own fee
+    // and always agree, which is precisely the case ZIP 318 forbids.
+    #[cfg(feature = "orchard")]
+    let canonical_fee = crate::fees::canonical_crossing_fee(params, target_height.into()).ok();
+
+    // The whole attempt is Orchard-gated: without that feature there is no Ironwood pool to cross
+    // into, so there is no canonical crossing to construct.
+    #[cfg(feature = "orchard")]
+    let bucketed_policy = canonical_crossing_candidate(params, &zip318, &request, target_height)
+        .then(|| params.activation_height(NetworkUpgrade::Nu6_3))
+        .flatten()
+        .and_then(|activation| {
+            confirmations_policy.bucketed(zip318.anchor_grid(), target_height, activation)
+        })
+        // A canonical crossing spends an Orchard note; if the caller forbids that, there is no
+        // canonical path to attempt.
+        .filter(|_| spend_policy.permits_shielded(ShieldedPool::Orchard));
+
+    // An anchor must be COMPUTABLE at the chosen boundary, not merely arithmetically valid: the
+    // data source must be able to produce the Orchard tree root there. A wallet that scanned
+    // past NU6.3 activation before boundary checkpointing was repaired is permanently missing
+    // the boundaries whose blocks carried no shielded outputs, and the hole cannot be backfilled
+    // from local state. Abandoning the attempt here degrades to an ordinary crossing — the same
+    // fallback taken when no sufficiently-old note exists — rather than proposing a transaction
+    // whose build must fail with `AnchorNotFound`. Under repaired retention the miss is
+    // temporary: freshly scanned boundaries rotate into the age-1 position within about a grid
+    // interval of upgrading.
+    #[cfg(feature = "orchard")]
+    let bucketed_policy = match bucketed_policy {
+        Some(policy) => wallet_db
+            .anchor_computable(ShieldedPool::Orchard, policy.anchor_height(target_height))
+            .map_err(|e| Error::from(InputSelectorError::DataSource(e)))?
+            .then_some(policy),
+        None => None,
+    };
+
+    #[cfg(feature = "orchard")]
+    let canonical_attempt = bucketed_policy.map(|bucketed_policy| {
+        // Single-note funding is PREFERRED, not merely hoped for: a migration transfer
+        // spends exactly one note, and accumulation reaches the target through several
+        // small notes whenever the oldest notes are small — funding perfectly well while
+        // losing the canonical shape. Preferring the oldest single covering note makes the
+        // canonical outcome the common one; when no single note covers the payment, the
+        // fallback accumulation funds it and the shape check below discards the attempt,
+        // exactly as before.
+        let orchard_only = input_selection::SpendPolicy::shielded_pools([ShieldedPool::Orchard])
+            .with_locked_input_policy(spend_policy.locked_input_policy().clone())
+            .with_note_selection(input_selection::NoteSelection::PreferSingle);
+
+        input_selector.propose_transaction(
+            params,
+            wallet_db,
+            target_height,
+            bucketed_policy.anchor_height(target_height),
+            &zip318,
+            bucketed_policy,
+            spend_from_account,
+            request.clone(),
+            change_strategy,
+            &orchard_only,
+            proposed_version,
+        )
+    });
+
+    // Only two outcomes justify falling back to an ordinary proposal: the wallet cannot fund the
+    // payment under the stricter policy, or it funded one that is not in fact canonical. Every
+    // other error — data source, selection, change computation, proposal construction, address
+    // parsing, sync state — describes a condition the ordinary attempt would meet just the same,
+    // so suppressing it here would replace a precise diagnosis with a silently different
+    // transaction, or with an identical failure reported from a second, wasted selection pass.
+    #[cfg(feature = "orchard")]
+    let canonical_proposal = match canonical_attempt {
+        Some(Ok(proposal)) => {
+            // The authoritative test is the one the builder will also apply, so that there is
+            // exactly one definition of "canonical" and the two cannot disagree. A proposal that
+            // funded successfully but not from a single Orchard note fails it here and is
+            // discarded, costing a selection pass but no extra confirmations.
+            let is_canonical = proposal.steps().len() == 1
+                && canonical_fee.is_some_and(|fee| {
+                    proposal.steps().first().is_canonical_crossing(&zip318, fee)
+                });
+            is_canonical.then_some(proposal)
+        }
+        Some(Err(InputSelectorError::InsufficientFunds { .. })) | None => None,
+        Some(Err(other)) => return Err(other.into()),
+    };
+
+    #[cfg(not(feature = "orchard"))]
+    let canonical_proposal = None;
+
+    let proposal = match canonical_proposal {
+        Some(proposal) => proposal,
+        None => input_selector.propose_transaction(
+            params,
+            wallet_db,
+            target_height,
+            anchor_height,
+            &zip318,
+            confirmations_policy,
+            spend_from_account,
+            request,
+            change_strategy,
+            spend_policy,
+            proposed_version,
+        )?,
+    };
+    proposal.check_transaction_size()?;
     if let Some(request) = lock_inputs {
         let lock_expiry_height = target_height + request.for_blocks();
         lock_proposal_inputs(wallet_db, &proposal, request.owner(), lock_expiry_height)?;
@@ -878,6 +950,52 @@ where
     // Record the requested version on the proposal so that it is carried through to transaction
     // building; when `None`, building falls back to the version implied by the target height.
     Ok(proposal.with_proposed_version(proposed_version))
+}
+
+/// Returns whether `request` is worth attempting as a canonical ZIP 318 crossing: a single
+/// payment, of a canonical denomination, at a height where the Ironwood pool exists.
+///
+/// This is a cheap gate, not a decision. It deliberately does not resolve the recipient address to
+/// an output pool, nor consider which notes are available: those depend on input selection, which
+/// has not run yet. The authoritative test is [`Step::is_canonical_crossing`] applied to the
+/// resulting proposal, so a request that passes here but produces a non-canonical proposal is
+/// simply discarded. Keeping the gate loose avoids duplicating address-resolution logic that would
+/// then have to be kept in step with input selection.
+#[cfg(feature = "orchard")]
+fn canonical_crossing_candidate<ParamsT: consensus::Parameters>(
+    params: &ParamsT,
+    zip318: &PoolMigrationParams,
+    request: &zip321::TransactionRequest,
+    target_height: TargetHeight,
+) -> bool {
+    params.is_nu_active(NetworkUpgrade::Nu6_3, target_height.into())
+        && match request.payments().values().collect::<Vec<_>>()[..] {
+            [payment] => payment
+                .amount()
+                .is_some_and(|amount| zip318.is_canonical_denomination(amount)),
+            _ => false,
+        }
+}
+
+/// Returns whether `step` will be built as a canonical ZIP 318 crossing, under the ZIP 318
+/// parameters `wallet_db` reports and the fee the canonical shape costs at `target_height`.
+///
+/// Shared by every path that builds a proposal, so that each asks the same question of the same
+/// data. `create_pczt_from_proposal` in particular applies its expiry override after the builder
+/// has run, and so cannot rely on the check inside `build_proposed_transaction`.
+#[cfg(feature = "orchard")]
+fn step_is_canonical_crossing<DbT, ParamsT, N>(
+    wallet_db: &DbT,
+    params: &ParamsT,
+    step: &Step<N>,
+    target_height: TargetHeight,
+) -> bool
+where
+    DbT: WalletRead,
+    ParamsT: consensus::Parameters,
+{
+    crate::fees::canonical_crossing_fee(params, target_height.into())
+        .is_ok_and(|fee| step.is_canonical_crossing(&wallet_db.pool_migration_params(params), fee))
 }
 
 /// Proposes making a payment to the specified address from the given account.
@@ -936,10 +1054,8 @@ pub fn propose_standard_transfer_to_address<DbT, ParamsT, CommitmentTreeErrT>(
 where
     ParamsT: consensus::Parameters + Clone,
     DbT: InputSource,
-    DbT: WalletWrite<
-            Error = <DbT as InputSource>::Error,
-            AccountId = <DbT as InputSource>::AccountId,
-        >,
+    DbT: WalletWrite,
+    DbT: WalletRead<Error = <DbT as InputSource>::Error, AccountId = <DbT as InputSource>::AccountId>,
     DbT::NoteRef: Copy + Eq + Ord,
 {
     let request = zip321::TransactionRequest::new(vec![
@@ -1131,10 +1247,13 @@ where
             to_account,
             target_height,
             anchor_height,
+            &wallet_db.pool_migration_params(params),
             confirmations_policy,
             output_filter,
         )
         .map_err(Error::from)?;
+
+    proposal.check_transaction_size()?;
 
     if let Some(request) = lock_inputs {
         let lock_expiry_height = target_height + request.for_blocks();
@@ -1254,6 +1373,10 @@ struct StepResult<AccountId> {
 /// This consists of a [`UnifiedSpendingKey`], plus (if the `transparent-key-import` feature is
 /// enabled) a set of standalone transparent spending keys corresponding to inputs being spent in a
 /// transaction under construction.
+///
+/// When this value is dropped, the standalone transparent spending keys it holds are
+/// overwritten. Copies of those keys made elsewhere are not overwritten, because
+/// [`secp256k1::SecretKey`] is `Copy`.
 pub struct SpendingKeys {
     usk: UnifiedSpendingKey,
     #[cfg(feature = "transparent-key-import")]
@@ -1287,30 +1410,50 @@ impl SpendingKeys {
     }
 }
 
-/// Constructs, proves, and signs the transaction for each step of the given proposal,
-/// returning the account and the per-step results without persisting anything.
+#[cfg(feature = "transparent-key-import")]
+impl Drop for SpendingKeys {
+    fn drop(&mut self) {
+        for secret_key in self.standalone_transparent_keys.values_mut().flatten() {
+            secret_key.non_secure_erase();
+        }
+    }
+}
+
+/// Construct, prove, and sign a transaction or series of transactions using the inputs supplied by
+/// the given proposal, and persist it to the wallet database.
 ///
-/// This is the shared implementation behind [`create_proposed_transactions`] and
-/// [`create_proposed_transactions_detached`]; the caller decides whether the resulting
-/// transactions are stored as pending sent transactions.
+/// Returns the database identifier for each newly constructed transaction, or an error if
+/// an error occurs in transaction construction, proving, or signing.
+///
+/// `rng` supplies the randomness used to construct, prove, and sign each transaction.
+///
+/// When evaluating multi-step proposals, only transparent outputs of any given step may be spent
+/// in later steps; attempting to spend a shielded note (including change) output by an earlier
+/// step is not supported, because the ultimate positions of those notes in the global note
+/// commitment tree cannot be known until the transaction that produces those notes is mined,
+/// and therefore the required spend proofs for such notes cannot be constructed.
+///
+/// `expiry_height`, when set, replaces the builder-derived expiry for every step's
+/// transaction before it is built and signed.
+///
+/// A nonzero `expiry_height` below the proposal's
+/// [`min_target_height`](Proposal::min_target_height) is rejected with
+/// [`Error::ExpiryHeightBelowTargetHeight`]. An `expiry_height` of zero,
+/// which disables expiry, is exempt from this check.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
-fn create_proposed_transaction_steps<'a, DbT, ParamsT, InputsErrT, FeeRuleT, ChangeErrT, N>(
+pub fn create_proposed_transactions<DbT, ParamsT, InputsErrT, FeeRuleT, ChangeErrT, N>(
     wallet_db: &mut DbT,
     params: &ParamsT,
+    clock: &impl Clock,
+    rng: &mut impl CryptoRng,
     spend_prover: &impl SpendProver,
     output_prover: &impl OutputProver,
     spending_keys: &SpendingKeys,
     ovk_policy: OvkPolicy,
-    proposal: &'a Proposal<FeeRuleT, N>,
+    proposal: &Proposal<FeeRuleT, N>,
     expiry_height: Option<BlockHeight>,
-) -> Result<
-    (
-        <DbT as WalletRead>::AccountId,
-        Vec<(&'a Step<N>, StepResult<<DbT as WalletRead>::AccountId>)>,
-    ),
-    CreateErrT<DbT, InputsErrT, FeeRuleT, ChangeErrT, N>,
->
+) -> Result<NonEmpty<TxId>, CreateErrT<DbT, InputsErrT, FeeRuleT, ChangeErrT, N>>
 where
     DbT: WalletWrite + WalletCommitmentTrees,
     ParamsT: consensus::Parameters + Clone,
@@ -1319,6 +1462,11 @@ where
     // The transaction version is carried on the proposal, chosen when the proposal was
     // constructed; `None` builds at the version implied by the target height.
     let proposed_version = proposal.proposed_version();
+
+    // Defense-in-depth: reject oversized proposals at the build entry point, so a
+    // proposal from a third-party input selector or a deserialized proposal that
+    // bypassed the `propose_*` wrappers cannot reach the expensive proving path.
+    proposal.check_transaction_size()?;
 
     if let Some(expiry_height) = expiry_height {
         let min_target_height = BlockHeight::from(proposal.min_target_height());
@@ -1342,11 +1490,14 @@ where
         .ok_or(Error::KeyNotRecognized)?
         .id();
 
+    let now = clock.now();
+
     let mut step_results = Vec::with_capacity(proposal.steps().len());
     for step in proposal.steps() {
         let step_result: StepResult<_> = create_proposed_transaction(
             wallet_db,
             params,
+            &mut *rng,
             spend_prover,
             output_prover,
             spending_keys,
@@ -1361,6 +1512,7 @@ where
             &mut unused_transparent_outputs,
             proposed_version,
             expiry_height,
+            now,
         )?;
         step_results.push((step, step_result));
     }
@@ -1376,70 +1528,7 @@ where
         }
     }
 
-    Ok((account_id, step_results))
-}
-
-#[cfg(feature = "transparent-inputs")]
-fn requires_ephemeral_transparent_reservation<FeeRuleT, N>(
-    proposal: &Proposal<FeeRuleT, N>,
-) -> bool {
-    proposal.steps().iter().any(|step| {
-        step.balance()
-            .proposed_change()
-            .iter()
-            .any(|change| change.is_ephemeral() && change.output_pool() == PoolType::Transparent)
-    })
-}
-
-/// Construct, prove, and sign a transaction or series of transactions using the inputs supplied by
-/// the given proposal, and persist it to the wallet database.
-///
-/// Returns the database identifier for each newly constructed transaction, or an error if
-/// an error occurs in transaction construction, proving, or signing.
-///
-/// When evaluating multi-step proposals, only transparent outputs of any given step may be spent
-/// in later steps; attempting to spend a shielded note (including change) output by an earlier
-/// step is not supported, because the ultimate positions of those notes in the global note
-/// commitment tree cannot be known until the transaction that produces those notes is mined,
-/// and therefore the required spend proofs for such notes cannot be constructed.
-///
-/// `expiry_height`, when set, replaces the builder-derived expiry for every step's
-/// transaction before it is built and signed.
-///
-/// A nonzero `expiry_height` below the proposal's
-/// [`min_target_height`](Proposal::min_target_height) is rejected with
-/// [`Error::ExpiryHeightBelowTargetHeight`]. An `expiry_height` of zero,
-/// which disables expiry, is exempt from this check.
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::type_complexity)]
-pub fn create_proposed_transactions<DbT, ParamsT, InputsErrT, FeeRuleT, ChangeErrT, N>(
-    wallet_db: &mut DbT,
-    params: &ParamsT,
-    spend_prover: &impl SpendProver,
-    output_prover: &impl OutputProver,
-    spending_keys: &SpendingKeys,
-    ovk_policy: OvkPolicy,
-    proposal: &Proposal<FeeRuleT, N>,
-    expiry_height: Option<BlockHeight>,
-) -> Result<NonEmpty<TxId>, CreateErrT<DbT, InputsErrT, FeeRuleT, ChangeErrT, N>>
-where
-    DbT: WalletWrite + WalletCommitmentTrees,
-    ParamsT: consensus::Parameters + Clone,
-    FeeRuleT: FeeRule,
-{
-    let (account_id, step_results) = create_proposed_transaction_steps(
-        wallet_db,
-        params,
-        spend_prover,
-        output_prover,
-        spending_keys,
-        ovk_policy,
-        proposal,
-        expiry_height,
-    )?;
-
-    // TODO: This should be provided by a `Clock`
-    let created = time::OffsetDateTime::now_utc();
+    let created = time::OffsetDateTime::from(now);
 
     // Store the transactions only after creating all of them. This avoids undesired
     // retransmissions in case a transaction is stored and the creation of a subsequent
@@ -1467,58 +1556,6 @@ where
         .map_err(Error::DataSource)?;
 
     Ok(NonEmpty::from_vec(txids).expect("proposal.steps is NonEmpty"))
-}
-
-/// Construct, prove, and sign a transaction or series of transactions using the inputs supplied by
-/// the given proposal, without persisting them as pending sent transactions in the wallet database.
-///
-/// Returns each newly constructed transaction, or an error if an error occurs in transaction
-/// construction, proving, or signing.
-///
-/// This function is intended for sign-only workflows. It does not call
-/// [`WalletWrite::store_transactions_to_be_sent`], so the returned transactions will not be
-/// retransmitted by the wallet and must be submitted by the caller.
-///
-/// `expiry_height` is validated exactly as in [`create_proposed_transactions`].
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::type_complexity)]
-pub fn create_proposed_transactions_detached<DbT, ParamsT, InputsErrT, FeeRuleT, ChangeErrT, N>(
-    wallet_db: &mut DbT,
-    params: &ParamsT,
-    spend_prover: &impl SpendProver,
-    output_prover: &impl OutputProver,
-    spending_keys: &SpendingKeys,
-    ovk_policy: OvkPolicy,
-    proposal: &Proposal<FeeRuleT, N>,
-    expiry_height: Option<BlockHeight>,
-) -> Result<NonEmpty<Transaction>, CreateErrT<DbT, InputsErrT, FeeRuleT, ChangeErrT, N>>
-where
-    DbT: WalletWrite + WalletCommitmentTrees,
-    ParamsT: consensus::Parameters + Clone,
-    FeeRuleT: FeeRule,
-{
-    #[cfg(feature = "transparent-inputs")]
-    if requires_ephemeral_transparent_reservation(proposal) {
-        return Err(Error::ProposalNotSupported);
-    }
-
-    let (_, step_results) = create_proposed_transaction_steps(
-        wallet_db,
-        params,
-        spend_prover,
-        output_prover,
-        spending_keys,
-        ovk_policy,
-        proposal,
-        expiry_height,
-    )?;
-
-    let transactions = step_results
-        .iter()
-        .map(|(_, step_result)| step_result.build_result.transaction().clone())
-        .collect();
-
-    Ok(NonEmpty::from_vec(transactions).expect("proposal.steps is NonEmpty"))
 }
 
 /// A recipient of a shielded output under construction, awaiting the decrypted [`Note`]
@@ -1660,6 +1697,59 @@ struct BuildState<P, AccountId> {
     utxos_spent: Vec<OutPoint>,
 }
 
+/// Enforces the ZIP 316 Revision 2 address expiration rules for a payment recipient: a
+/// payment must not be made to an address that is known to have expired, and when the
+/// recipient defines an expiry height, the transaction must carry a nonzero expiry
+/// height no greater than it. All recipients of a multi-recipient transaction are
+/// subject to these constraints.
+///
+/// An address that defines an expiry height is expired once the chain has advanced past
+/// that height. `min_target_height` is the next chain tip, so the tip that expiry is
+/// evaluated against is one block below it.
+fn check_recipient_expiry(
+    ua: &UnifiedAddress,
+    min_target_height: TargetHeight,
+    tx_expiry_height: Option<BlockHeight>,
+    now: SystemTime,
+) -> Result<(), AddressExpiryError> {
+    if let Some(address_expiry) = ua.expiry_height() {
+        let chain_height = min_target_height.saturating_sub(1);
+        if chain_height > address_expiry {
+            return Err(AddressExpiryError::HeightExpired {
+                address_expiry,
+                chain_height,
+            });
+        }
+
+        match tx_expiry_height {
+            None => {
+                return Err(AddressExpiryError::TransactionExpiryDisabled { address_expiry });
+            }
+            Some(transaction_expiry) if transaction_expiry > address_expiry => {
+                return Err(AddressExpiryError::ExpiryHeightConflict {
+                    address_expiry,
+                    transaction_expiry,
+                });
+            }
+            Some(_) => {}
+        }
+    }
+
+    if let Some(expiry_time) = ua.expiry_time() {
+        // A clock before the Unix epoch reads as time zero, at which no address with
+        // expiry-time metadata is expired.
+        let now_secs = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now_secs > expiry_time {
+            return Err(AddressExpiryError::TimeExpired { expiry_time });
+        }
+    }
+
+    Ok(())
+}
+
 // `unused_transparent_outputs` maps `StepOutput`s for transparent outputs
 // that have not been consumed so far, to the corresponding pair of
 // `TransparentAddress` and `Outpoint`.
@@ -1687,7 +1777,12 @@ fn build_proposed_transaction<DbT, ParamsT, InputsErrT, FeeRuleT, ChangeErrT, N>
     // Overrides the builder-derived expiry height, when set. Applied immediately after
     // `Builder::new` below, before any inputs are added or signatures/proofs are produced.
     expiry_height: Option<BlockHeight>,
-) -> Result<BuildState<ParamsT, DbT::AccountId>, CreateErrT<DbT, InputsErrT, FeeRuleT, ChangeErrT, N>>
+    // The current time, used to enforce recipient address expiry.
+    now: SystemTime,
+) -> Result<
+    BuildState<ParamsT, <DbT as WalletRead>::AccountId>,
+    CreateErrT<DbT, InputsErrT, FeeRuleT, ChangeErrT, N>,
+>
 where
     DbT: WalletWrite + WalletCommitmentTrees,
     ParamsT: consensus::Parameters + Clone,
@@ -1883,6 +1978,18 @@ where
     let ironwood_anchor = None;
 
     // Create the transaction. The type of the proposal ensures that there
+    // The Ironwood bundle's padding is DERIVED from the step, independently of the Orchard
+    // bundle's: it is unpadded for a canonical ZIP 318 crossing and padded otherwise. The two
+    // pools' padding is deliberately not coupled — an Orchard bundle is always padded, and the
+    // Ironwood bundle drops its padding only when doing so makes the transaction indistinguishable
+    // from a migration transfer. The fee model reaches the same conclusion from the same data (see
+    // `fees::common::single_pool_output_balance`), which is what keeps the computed fee and the
+    // built bundle in agreement.
+    #[cfg(feature = "orchard")]
+    let ironwood_padding = proposal_step.ironwood_bundle_padding();
+    #[cfg(not(feature = "orchard"))]
+    let ironwood_padding = orchard_pool_padding;
+
     // are no possible transparent inputs, so we ignore those here.
     let mut builder = Builder::new(
         params.clone(),
@@ -1892,12 +1999,38 @@ where
             orchard_anchor,
             ironwood_anchor,
             orchard_padding: orchard_pool_padding,
-            ironwood_padding: orchard_pool_padding,
+            ironwood_padding,
         },
     );
+    // A canonical crossing takes the ZIP 318 rolling expiry, which every crossing in the same
+    // modulus period shares. The builder's ordinary per-transaction expiry (target height plus a
+    // small delta) would single it out immediately, undoing the shape the unpadded bundle and the
+    // bucketed anchor were chosen to produce. A caller-supplied expiry is refused rather than
+    // silently overridden: the padding and anchor are already fixed by this point, so honouring it
+    // would emit a transaction that is canonical in every respect but one.
+    #[cfg(feature = "orchard")]
+    let expiry_height = {
+        if step_is_canonical_crossing(wallet_db, params, proposal_step, min_target_height) {
+            match expiry_height {
+                Some(requested) => {
+                    return Err(Error::ExpiryHeightConflictsWithCanonicalCrossing { requested });
+                }
+                None => Some(zcash_protocol::zip318::expiry_height(
+                    &zcash_protocol::zip318::BlockSpacing::for_network(params),
+                    min_target_height.into(),
+                )),
+            }
+        } else {
+            expiry_height
+        }
+    };
+
     if let Some(expiry_height) = expiry_height {
         builder = builder.with_expiry_height(expiry_height);
     }
+
+    // The expiry height the built transaction will carry, or `None` if it does not expire.
+    let tx_expiry_height = Some(builder.expiry_height()).filter(|h| *h != consensus::H0);
 
     if let Some(version) = proposed_version {
         builder.propose_version(version)?;
@@ -2015,7 +2148,7 @@ where
                         address_index,
                     } => {
                         let pubkey = ufvk
-                            .transparent()
+                            .p2pkh()
                             .ok_or(Error::KeyNotAvailable(PoolType::Transparent))?
                             .derive_address_pubkey(*scope, *address_index)
                             .expect("spending key derivation should not fail");
@@ -2034,6 +2167,12 @@ where
                                 .map_err(|_| ::transparent::builder::Error::UnsupportedScript)?;
                         utxos_spent.push(outpoint.clone());
                         builder.add_transparent_p2sh_input(from_chain, outpoint, txout)?;
+                    }
+                    // An address imported without key material cannot construct a spend: the
+                    // wallet holds neither the pubkey nor the redeem script for the input.
+                    #[cfg(feature = "transparent-key-import")]
+                    TransparentAddressSource::StandaloneAddress => {
+                        return Err(Error::KeyNotAvailable(PoolType::Transparent));
                     }
                 }
 
@@ -2217,10 +2356,20 @@ where
                 Ok(())
             };
 
-        match recipient_address
+        let recipient = recipient_address
             .clone()
-            .convert_if_network(params.network_type())?
-        {
+            .convert_if_network(params.network_type())?;
+
+        if let Address::Unified(ua) = &recipient {
+            check_recipient_expiry(ua, min_target_height, tx_expiry_height, now).map_err(
+                |error| Error::RecipientAddressExpiry {
+                    payment_index,
+                    error,
+                },
+            )?;
+        }
+
+        match recipient {
             Address::Unified(ua) => match output_pool {
                 #[cfg(not(feature = "orchard"))]
                 PoolType::Shielded(ShieldedPool::Orchard) => {
@@ -2255,7 +2404,7 @@ where
                 }
             },
             Address::Sapling(to) => {
-                add_sapling_output(&mut builder, &mut sapling_output_meta, to)?;
+                add_sapling_output(&mut builder, &mut sapling_output_meta, *to)?;
             }
             Address::Transparent(to) => {
                 add_transparent_output(&mut builder, &mut transparent_output_meta, to)?;
@@ -2499,6 +2648,7 @@ where
 fn create_proposed_transaction<DbT, ParamsT, InputsErrT, FeeRuleT, ChangeErrT, N>(
     wallet_db: &mut DbT,
     params: &ParamsT,
+    rng: &mut impl CryptoRng,
     spend_prover: &impl SpendProver,
     output_prover: &impl OutputProver,
     spending_keys: &SpendingKeys,
@@ -2515,6 +2665,7 @@ fn create_proposed_transaction<DbT, ParamsT, InputsErrT, FeeRuleT, ChangeErrT, N
     >,
     proposed_version: Option<TxVersion>,
     expiry_height: Option<BlockHeight>,
+    now: SystemTime,
 ) -> Result<
     StepResult<<DbT as WalletRead>::AccountId>,
     CreateErrT<DbT, InputsErrT, FeeRuleT, ChangeErrT, N>,
@@ -2540,6 +2691,7 @@ where
         // The non-PCZT path always builds padded Orchard-pool bundles.
         BundlePadding::DEFAULT,
         expiry_height,
+        now,
     )?;
 
     // Build the transaction with the specified fee rule
@@ -2571,11 +2723,21 @@ where
                     transparent_signing_set.add_key(*key);
                 }
             }
+            // Unreachable in practice: inputs from an address imported without key material
+            // are rejected when the proposed transaction is constructed.
+            #[cfg(feature = "transparent-key-import")]
+            TransparentAddressSource::StandaloneAddress => {
+                return Err(Error::AddressNotRecognized(_address));
+            }
         }
     }
     let sapling_extsks = &[
         spending_keys.usk.sapling().clone(),
-        spending_keys.usk.sapling().derive_internal(),
+        spending_keys
+            .usk
+            .sapling()
+            .derive_internal()
+            .ok_or(Error::KeyNotAvailable(PoolType::SAPLING))?,
     ];
     #[cfg(feature = "orchard")]
     let orchard_saks = &[spending_keys.usk.orchard().into()];
@@ -2585,7 +2747,7 @@ where
         &transparent_signing_set,
         sapling_extsks,
         orchard_saks,
-        OsRng,
+        rng,
         spend_prover,
         output_prover,
         fee_rule,
@@ -2794,17 +2956,21 @@ where
 /// which disables expiry, is exempt from this check.
 ///
 /// `orchard_pool_padding` selects the transactional bundle padding for the Orchard
-/// and Ironwood bundles, and must match the change strategy used to create
-/// `proposal` (see
-/// `zip317::SingleOutputChangeStrategy::with_unpadded_orchard_pool_bundles`); pass
-/// [`BundlePadding::DEFAULT`](zcash_primitives::transaction::builder::BundlePadding)
-/// otherwise.
+/// bundle; pass
+/// [`BundlePadding::DEFAULT`](zcash_primitives::transaction::builder::BundlePadding).
+/// The Ironwood bundle's padding is not a caller's to choose: it is derived from the
+/// proposal by [`Step::ironwood_bundle_padding`](crate::proposal::Step::ironwood_bundle_padding),
+/// so that it matches the action count the fee was computed from.
+///
+/// `rng` supplies the randomness used to construct the PCZT and to sign its dummy spends.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[cfg(feature = "pczt")]
 pub fn create_pczt_from_proposal<DbT, ParamsT, InputsErrT, FeeRuleT, ChangeErrT, N>(
     wallet_db: &mut DbT,
     params: &ParamsT,
+    clock: &impl Clock,
+    rng: &mut impl CryptoRng,
     account_id: <DbT as WalletRead>::AccountId,
     ovk_policy: OvkPolicy,
     proposal: &Proposal<FeeRuleT, N>,
@@ -2815,7 +2981,7 @@ where
     DbT: WalletWrite + WalletCommitmentTrees,
     ParamsT: consensus::Parameters + Clone,
     FeeRuleT: FeeRule,
-    DbT::AccountId: serde::Serialize,
+    <DbT as WalletRead>::AccountId: serde::Serialize,
 {
     let account = wallet_db
         .get_account(account_id)
@@ -2828,6 +2994,10 @@ where
     if proposal.steps().len() > 1 {
         return Err(Error::ProposalNotSupported);
     }
+
+    // Defense-in-depth: reject oversized proposals at the build entry point.
+    proposal.check_transaction_size()?;
+
     let fee_rule = proposal.fee_rule();
     let min_target_height = proposal.min_target_height();
 
@@ -2864,23 +3034,20 @@ where
         unused_transparent_outputs,
         proposed_version,
         orchard_pool_padding,
-        // This path applies `expiry_height` after the PCZT is built instead (below),
-        // since overriding it via the builder would be redundant with that existing mechanism.
-        None,
+        expiry_height,
+        clock.now(),
     )?;
 
-    // Build the transaction with the specified fee rule
-    let mut build_result = build_state
+    // Build the transaction with the specified fee rule. The caller's expiry override
+    // (validated against canonical ZIP 318 crossings) was applied via the builder in
+    // `build_proposed_transaction` above, so the PCZT parts already carry it.
+    let build_result = build_state
         .builder
-        .build_for_pczt(OsRng, fee_rule, |_| false)?;
-
-    if let Some(expiry_height) = expiry_height {
-        build_result.pczt_parts.expiry_height = expiry_height;
-    }
+        .build_for_pczt(&mut *rng, fee_rule, |_| false)?;
 
     let created = Creator::build_from_parts(build_result.pczt_parts).ok_or(PcztError::Build)?;
 
-    let (io_finalized, _) = IoFinalizer::new(created).finalize_io()?;
+    let (io_finalized, _) = IoFinalizer::new(created).finalize_io(rng)?;
 
     #[cfg(feature = "orchard")]
     let orchard_outputs = build_state
@@ -2939,7 +3106,7 @@ where
         .update_global_with(|mut updater| {
             updater.set_proprietary(
                 PROPRIETARY_PROPOSAL_INFO.into(),
-                postcard::to_allocvec(&ProposalInfo::<DbT::AccountId> {
+                postcard::to_allocvec(&ProposalInfo::<<DbT as WalletRead>::AccountId> {
                     from_account: account_id,
                     target_height: proposal.min_target_height(),
                 })
@@ -3127,28 +3294,27 @@ where
                     .iter()
                     .enumerate()
                     .filter_map(|(index, input)| {
-                        build_state
-                            .transparent_input_addresses
-                            .get(
-                                &TransparentAddress::from_script_from_chain(input.script_pubkey())
-                                    .expect("we created this with a supported transparent address"),
-                            )
-                            .and_then(|address_metadata| match address_metadata.source() {
-                                TransparentAddressSource::Derived {
-                                    scope,
-                                    address_index,
-                                } => Some((index, *scope, *address_index)),
-                                #[cfg(feature = "transparent-key-import")]
-                                TransparentAddressSource::StandalonePubkey(_)
-                                | TransparentAddressSource::StandaloneScript(_) => None,
-                            })
+                        let address_metadata = build_state.transparent_input_addresses.get(
+                            &TransparentAddress::from_script_from_chain(input.script_pubkey())
+                                .expect("we created this with a supported transparent address"),
+                        )?;
+                        match address_metadata.source() {
+                            TransparentAddressSource::Derived {
+                                scope,
+                                address_index,
+                            } => Some((index, *scope, *address_index)),
+                            #[cfg(feature = "transparent-key-import")]
+                            TransparentAddressSource::StandalonePubkey(_)
+                            | TransparentAddressSource::StandaloneScript(_)
+                            | TransparentAddressSource::StandaloneAddress => None,
+                        }
                     })
                     .collect::<Vec<_>>();
 
                 for (index, scope, address_index) in inputs_to_update {
                     updater.update_input_with(index, |mut input_updater| {
                         let pubkey = ufvk
-                            .transparent()
+                            .p2pkh()
                             .expect("we derived this successfully in build_proposed_transaction")
                             .derive_address_pubkey(scope, address_index)
                             .expect("spending key derivation should not fail");
@@ -3352,13 +3518,14 @@ fn compact_signer_view(pczt: &pczt::Pczt) -> pczt::Pczt {
 ///
 /// In addition to the [`SignerView::Compact`] policy of [`redact_pczt_for_signer`],
 /// this removes spend full viewing keys and existing signatures. It also removes the
-/// randomizer from actions already authorized in `pczt`, while unsigned actions such
-/// as wallet controlled zero value spends retain theirs. Sapling signatures require a
+/// randomizer from actions already authorized in `pczt`, while unsigned actions such as
+/// wallet controlled zero value spends retain theirs. Sapling signatures require a
 /// separate signing path.
 ///
 /// The caller must retain the authoritative PCZT and apply the returned signature
-/// contributions to it. This function must run before its existing signatures are
-/// redacted. The returned view cannot be signed with the high level
+/// contributions to it; the returned view is not independently extractable. This
+/// function must run before its existing signatures are redacted. The returned view
+/// cannot be signed with the high level
 /// [`pczt::roles::signer::Signer`] because that role expects full viewing keys.
 #[cfg(feature = "pczt")]
 pub fn redact_pczt_for_batch_signer(pczt: &pczt::Pczt) -> pczt::Pczt {
@@ -3378,7 +3545,11 @@ pub fn redact_pczt_for_batch_signer(pczt: &pczt::Pczt) -> pczt::Pczt {
         mut redactor: pczt::roles::redactor::orchard::OrchardRedactor<'_>,
         preauthorized_action_indices: &[usize],
     ) {
-        // The batch Signer derives its FVK and returns only new signatures.
+        // The batch Signer derives its FVK and returns only new signatures. Existing
+        // signatures MUST be omitted: deployed batch Signers reject requests that
+        // already carry signatures. Omitting them strands nothing — this view is a
+        // signing request, not the authoritative PCZT, and the caller's authoritative
+        // copy retains them.
         redactor.redact_actions(|mut action| {
             action.clear_spend_fvk();
             action.clear_spend_auth_sig();
@@ -3417,9 +3588,14 @@ pub fn redact_pczt_for_batch_signer(pczt: &pczt::Pczt) -> pczt::Pczt {
 /// - `orchard_vk` is optional to allow the caller to control where the Orchard verifying
 ///   key is generated or cached. If `orchard_vk` is `None`, and the PCZT has an Orchard
 ///   bundle, an Orchard verifying key will be generated on the fly.
+///
+/// `rng` supplies the randomness for the binding signatures and for verifying the extracted
+/// transaction.
 #[cfg(feature = "pczt")]
 pub fn extract_and_store_transaction_from_pczt<DbT, N>(
     wallet_db: &mut DbT,
+    clock: &impl Clock,
+    rng: &mut impl CryptoRng,
     pczt: pczt::Pczt,
     sapling_vk: Option<(
         &sapling::circuit::SpendVerifyingKey,
@@ -3429,11 +3605,8 @@ pub fn extract_and_store_transaction_from_pczt<DbT, N>(
 ) -> Result<TxId, ExtractErrT<DbT, N>>
 where
     DbT: WalletWrite + WalletCommitmentTrees,
-    DbT::AccountId: serde::de::DeserializeOwned,
+    <DbT as WalletRead>::AccountId: serde::de::DeserializeOwned,
 {
-    use std::collections::BTreeMap;
-    use zcash_note_encryption::{Domain, ShieldedOutput};
-
     let finalized = SpendFinalizer::new(pczt).finalize_spends()?;
 
     let proposal_info = finalized
@@ -3442,83 +3615,112 @@ where
         .get(PROPRIETARY_PROPOSAL_INFO)
         .ok_or_else(|| PcztError::Invalid("PCZT missing proprietary proposal info field".into()))
         .and_then(|v| {
-            postcard::from_bytes::<ProposalInfo<DbT::AccountId>>(v).map_err(|e| {
+            postcard::from_bytes::<ProposalInfo<<DbT as WalletRead>::AccountId>>(v).map_err(|e| {
                 PcztError::Invalid(format!(
                     "Postcard decoding of proprietary proposal info failed: {e}"
                 ))
             })
         })?;
 
-    let orchard_output_info = finalized
-        .orchard()
-        .actions()
-        .iter()
-        .map(|act| {
-            let note = || {
-                let recipient =
-                    act.output().recipient().as_ref().and_then(|b| {
+    // The per-action sent-output recovery shared by the Orchard and Ironwood bundles, which
+    // differ only in the note plaintext version their notes carry (`V2` for Orchard, `V3` —
+    // ZIP 2005 — for Ironwood): the note reconstructed from the PCZT's output fields, zipped
+    // with the recipient metadata `create_pczt_from_proposal` attached to the output.
+    #[allow(clippy::type_complexity)]
+    fn orchard_protocol_output_info<AccountId: serde::de::DeserializeOwned>(
+        actions: &[pczt::orchard::Action],
+        note_version: orchard::note::NoteVersion,
+    ) -> Result<
+        Vec<
+            Option<(
+                (PcztRecipient<AccountId>, Option<ZcashAddress>),
+                orchard::Note,
+            )>,
+        >,
+        PcztError,
+    > {
+        actions
+            .iter()
+            .map(|act| {
+                let note = || {
+                    let recipient = act.output().recipient().as_ref().and_then(|b| {
                         ::orchard::Address::from_raw_address_bytes(b).into_option()
                     })?;
-                let value = act
-                    .output()
-                    .value()
-                    .map(orchard::value::NoteValue::from_raw)?;
-                let rho = orchard::note::Rho::from_bytes(act.spend().nullifier()).into_option()?;
-                let rseed = act.output().rseed().as_ref().and_then(|rseed| {
-                    orchard::note::RandomSeed::from_bytes(*rseed, &rho).into_option()
-                })?;
+                    let value = act
+                        .output()
+                        .value()
+                        .map(orchard::value::NoteValue::from_raw)?;
+                    let rho =
+                        orchard::note::Rho::from_bytes(act.spend().nullifier()).into_option()?;
+                    let rseed = act.output().rseed().as_ref().and_then(|rseed| {
+                        orchard::note::RandomSeed::from_bytes(*rseed, &rho).into_option()
+                    })?;
 
-                #[cfg(feature = "zsa")]
-                let note_version = if act.output().asset().is_some() {
-                    orchard::note::NoteVersion::V3ZSA
-                } else {
-                    orchard::note::NoteVersion::V2
+                    // ZSA notes carry an asset and a V3ZSA plaintext; without
+                    // one the caller-supplied version (V2 Orchard / V3
+                    // Ironwood) stands.
+                    #[cfg(feature = "zsa")]
+                    let note_version = if act.output().asset().is_some() {
+                        orchard::note::NoteVersion::V3ZSA
+                    } else {
+                        note_version
+                    };
+
+                    orchard::Note::from_parts(
+                        recipient,
+                        value,
+                        act.output()
+                            .asset()
+                            .as_ref()
+                            .and_then(|asset| {
+                                orchard::note::AssetBase::from_bytes(asset).into_option()
+                            })
+                            .unwrap_or_else(orchard::note::AssetBase::zatoshi),
+                        rho,
+                        rseed,
+                        note_version,
+                    )
+                    .into_option()
                 };
-                #[cfg(not(feature = "zsa"))]
-                let note_version = orchard::note::NoteVersion::V2;
 
-                orchard::Note::from_parts(
-                    recipient,
-                    value,
-                    act.output()
-                        .asset()
-                        .as_ref()
-                        .and_then(|asset| orchard::note::AssetBase::from_bytes(asset).into_option())
-                        .unwrap_or_else(orchard::note::AssetBase::zatoshi),
-                    rho,
-                    rseed,
-                    note_version,
-                )
-                .into_option()
-            };
+                let external_address = act
+                    .output()
+                    .user_address()
+                    .as_deref()
+                    .map(ZcashAddress::try_from_encoded)
+                    .transpose()
+                    .map_err(|e| PcztError::Invalid(format!("Invalid user_address: {e}")))?;
 
-            let external_address = act
-                .output()
-                .user_address()
-                .as_deref()
-                .map(ZcashAddress::try_from_encoded)
-                .transpose()
-                .map_err(|e| PcztError::Invalid(format!("Invalid user_address: {e}")))?;
+                let pczt_recipient = act
+                    .output()
+                    .proprietary()
+                    .get(PROPRIETARY_OUTPUT_INFO)
+                    .map(|v| postcard::from_bytes::<PcztRecipient<AccountId>>(v))
+                    .transpose()
+                    .map_err(|e: postcard::Error| {
+                        PcztError::Invalid(format!(
+                            "Postcard decoding of proprietary output info failed: {e}"
+                        ))
+                    })?
+                    .map(|pczt_recipient| (pczt_recipient, external_address));
 
-            let pczt_recipient = act
-                .output()
-                .proprietary()
-                .get(PROPRIETARY_OUTPUT_INFO)
-                .map(|v| postcard::from_bytes::<PcztRecipient<DbT::AccountId>>(v))
-                .transpose()
-                .map_err(|e: postcard::Error| {
-                    PcztError::Invalid(format!(
-                        "Postcard decoding of proprietary output info failed: {e}"
-                    ))
-                })?
-                .map(|pczt_recipient| (pczt_recipient, external_address));
+                // If the pczt recipient is not present, this is a dummy note; if the note is not
+                // present, then the PCZT has been pruned to make this output unrecoverable and so
+                // we also ignore it.
+                Ok(pczt_recipient.zip(note()))
+            })
+            .collect::<Result<Vec<_>, PcztError>>()
+    }
 
-            // If the pczt recipient is not present, this is a dummy note; if the note is not
-            // present, then the PCZT has been pruned to make this output unrecoverable and so we
-            // also ignore it.
-            Ok(pczt_recipient.zip(note()))
-        })
-        .collect::<Result<Vec<_>, PcztError>>()?;
+    let orchard_output_info = orchard_protocol_output_info::<<DbT as WalletRead>::AccountId>(
+        finalized.orchard().actions(),
+        orchard::note::NoteVersion::V2,
+    )?;
+
+    let ironwood_output_info = orchard_protocol_output_info::<<DbT as WalletRead>::AccountId>(
+        finalized.ironwood().actions(),
+        orchard::note::NoteVersion::V3,
+    )?;
 
     let sapling_output_info = finalized
         .sapling()
@@ -3550,7 +3752,7 @@ where
             let pczt_recipient = out
                 .proprietary()
                 .get(PROPRIETARY_OUTPUT_INFO)
-                .map(|v| postcard::from_bytes::<PcztRecipient<DbT::AccountId>>(v))
+                .map(|v| postcard::from_bytes::<PcztRecipient<<DbT as WalletRead>::AccountId>>(v))
                 .transpose()
                 .map_err(|e: postcard::Error| {
                     PcztError::Invalid(format!(
@@ -3581,7 +3783,7 @@ where
             let pczt_recipient = out
                 .proprietary()
                 .get(PROPRIETARY_OUTPUT_INFO)
-                .map(|v| postcard::from_bytes::<PcztRecipient<DbT::AccountId>>(v))
+                .map(|v| postcard::from_bytes::<PcztRecipient<<DbT as WalletRead>::AccountId>>(v))
                 .transpose()
                 .map_err(|e: postcard::Error| {
                     PcztError::Invalid(format!(
@@ -3615,7 +3817,7 @@ where
     if let Some(orchard_vk) = orchard_vk {
         tx_extractor = tx_extractor.with_orchard(orchard_vk);
     }
-    let transaction = tx_extractor.extract()?;
+    let transaction = tx_extractor.extract(rng)?;
     let txid = transaction.txid();
 
     #[allow(clippy::too_many_arguments)]
@@ -3643,6 +3845,15 @@ where
             MemoBytes::from_bytes(memo_bytes(&m)).expect("Memo is the correct length.")
         });
 
+        // The note commitment tree an output's note is appended to is fully determined by the
+        // pool the output was created in; recording it mirrors the transaction-builder path
+        // (`create_proposed_transactions`), which tags every shielded sent output with its tree.
+        let note_commitment_tree = match output_pool {
+            ShieldedPool::Sapling => NoteCommitmentTree::Sapling,
+            ShieldedPool::Orchard => NoteCommitmentTree::Orchard,
+            ShieldedPool::Ironwood => NoteCommitmentTree::Ironwood,
+        };
+
         let note_value = Zatoshis::try_from(note_value(&note))?;
         let recipient = match (pczt_recipient, external_address) {
             (PcztRecipient::External, Some(addr)) => Ok(Recipient::External {
@@ -3669,7 +3880,8 @@ where
             }
         }?;
 
-        Ok(SentTransactionOutput::from_parts(
+        Ok(SentTransactionOutput::from_parts_in_tree(
+            Some(note_commitment_tree),
             output_index,
             recipient,
             note_value,
@@ -3753,6 +3965,40 @@ where
         }
     })
     .transpose()?;
+
+    #[cfg(feature = "orchard")]
+    let ironwood_outputs = transaction
+        .ironwood_bundle()
+        .map(|bundle| {
+            assert_eq!(bundle.actions().len(), ironwood_output_info.len());
+            bundle
+                .actions()
+                .iter()
+                .zip(ironwood_output_info)
+                .enumerate()
+                .filter_map(|(output_index, (action, output_info))| {
+                    output_info.map(|((pczt_recipient, external_address), note)| {
+                        let domain = IronwoodDomain::for_action(action);
+                        to_sent_transaction_output::<_, _, _, DbT, _>(
+                            domain,
+                            note,
+                            action,
+                            ShieldedPool::Ironwood,
+                            output_index,
+                            pczt_recipient,
+                            external_address,
+                            |note| note.value().inner(),
+                            |memo| memo,
+                            |note| Note::Orchard {
+                                note,
+                                pool: orchard::ValuePool::Ironwood,
+                            },
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
 
     let sapling_outputs = transaction
         .sapling_bundle()
@@ -3861,6 +4107,8 @@ where
     let mut outputs: Vec<SentTransactionOutput<_>> = vec![];
     #[cfg(feature = "orchard")]
     outputs.extend(orchard_outputs.into_iter().flatten());
+    #[cfg(feature = "orchard")]
+    outputs.extend(ironwood_outputs.into_iter().flatten());
     outputs.extend(sapling_outputs.into_iter().flatten());
     outputs.extend(transparent_outputs.into_iter().flatten());
 
@@ -3873,7 +4121,7 @@ where
     // We don't need the spent UTXOs to be in transaction order.
     let utxos_spent = utxos_map.into_keys().collect::<Vec<_>>();
 
-    let created = time::OffsetDateTime::now_utc();
+    let created = time::OffsetDateTime::from(clock.now());
 
     let transactions = vec![SentTransaction::new(
         &transaction,
@@ -3904,6 +4152,7 @@ where
 /// Parameters:
 /// * `wallet_db`: A read/write reference to the wallet database
 /// * `params`: Consensus parameters
+/// * `rng`: The source of randomness used to construct, prove, and sign the transaction.
 /// * `spend_prover`: The [`sapling::SpendProver`] to use in constructing the shielded
 ///   transaction.
 /// * `output_prover`: The [`sapling::OutputProver`] to use in constructing the shielded
@@ -3932,6 +4181,8 @@ where
 pub fn shield_transparent_funds<DbT, ParamsT, InputsT, ChangeT>(
     wallet_db: &mut DbT,
     params: &ParamsT,
+    clock: &impl Clock,
+    rng: &mut impl CryptoRng,
     spend_prover: &impl SpendProver,
     output_prover: &impl OutputProver,
     input_selector: &InputsT,
@@ -3964,6 +4215,8 @@ where
     create_proposed_transactions(
         wallet_db,
         params,
+        clock,
+        rng,
         spend_prover,
         output_prover,
         spending_keys,
@@ -3971,4 +4224,138 @@ where
         &proposal,
         None,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use zcash_protocol::zip318::{AnchorBucketInterval, BlockSpacing};
+
+    fn policy(confirmations: u32) -> ConfirmationsPolicy {
+        ConfirmationsPolicy::new_symmetrical_unchecked(
+            confirmations,
+            #[cfg(feature = "transparent-inputs")]
+            false,
+        )
+    }
+
+    fn target(height: u32) -> TargetHeight {
+        TargetHeight::from(BlockHeight::from_u32(height))
+    }
+
+    /// Bucketing raises the confirmation requirement so that the resulting anchor lands exactly on
+    /// a grid boundary. Because the anchor and the note-eligibility bound are the same quantity,
+    /// this is what guarantees every selected note has a witness at that anchor.
+    #[test]
+    fn bucketed_policy_lands_the_anchor_on_a_boundary() {
+        let interval = AnchorGrid::new(AnchorBucketInterval::ZIP_318, BlockSpacing::UNIFORM);
+        let policy = policy(10);
+
+        for height in [2_000_000u32, 2_000_143, 2_000_144, 1_000_000] {
+            let target = target(height);
+            let bucketed = policy
+                .bucketed(interval, target, BlockHeight::from_u32(1))
+                .expect("a boundary is reachable well above the grid's origin");
+            let anchor = bucketed.anchor_height(target);
+
+            assert!(
+                interval.is_boundary(anchor),
+                "anchor {anchor:?} off the grid"
+            );
+            // Age 1: one interval BELOW the most recent boundary, never the most recent itself.
+            let most_recent = interval.boundary_at_or_below(policy.anchor_height(target));
+            assert_eq!(
+                u32::from(anchor),
+                u32::from(most_recent) - interval.interval().block_count().get(),
+                "the chosen boundary must be exactly one interval below the most recent"
+            );
+            assert!(anchor < most_recent, "an age of 0 is not admissible");
+            // Never fewer confirmations than asked for, and the invariant is preserved.
+            assert!(bucketed.trusted() >= policy.trusted());
+            assert!(bucketed.untrusted() >= bucketed.trusted());
+            // The extra wait is bounded by two intervals: up to one to reach the most recent
+            // boundary, plus the one that age 1 steps back.
+            assert!(
+                u32::from(bucketed.trusted()) - u32::from(policy.trusted())
+                    < 2 * interval.interval().block_count().get()
+            );
+        }
+    }
+
+    /// Even an anchor already sitting on a boundary steps back one interval: that boundary is the
+    /// most recent, and ZIP 318 admits only ages of 1 or more.
+    #[test]
+    fn bucketing_never_chooses_the_most_recent_boundary() {
+        let interval = AnchorGrid::new(AnchorBucketInterval::ZIP_318, BlockSpacing::UNIFORM);
+        let policy = policy(10);
+        let aligned_anchor = interval.boundary_at_or_below(BlockHeight::from_u32(2_000_000));
+        let target = target(u32::from(aligned_anchor) + 10);
+
+        let bucketed = policy
+            .bucketed(interval, target, BlockHeight::from_u32(1))
+            .expect("reachable");
+        assert_eq!(
+            u32::from(bucketed.anchor_height(target)),
+            u32::from(aligned_anchor) - interval.interval().block_count().get()
+        );
+        assert!(bucketed.trusted() > policy.trusted());
+    }
+
+    /// Below the first boundary there is no grid to bucket to, and the policy declines rather than
+    /// producing a zero or negative confirmation count.
+    #[test]
+    fn bucketing_declines_below_the_first_boundary() {
+        let interval = AnchorGrid::new(AnchorBucketInterval::ZIP_318, BlockSpacing::UNIFORM);
+        let policy = policy(10);
+        // The ordinary anchor is 90, whose boundary-at-or-below is 0; there is no boundary an
+        // interval below that, so no admissible anchor exists.
+        assert!(
+            policy
+                .bucketed(interval, target(100), BlockHeight::from_u32(1))
+                .is_none()
+        );
+    }
+
+    /// A shorter test-network interval buckets on its own grid.
+    #[test]
+    fn bucketing_honours_a_custom_interval() {
+        let interval = AnchorGrid::new(
+            AnchorBucketInterval::custom(NonZeroU32::new(12).expect("nonzero")),
+            BlockSpacing::UNIFORM,
+        );
+        let policy = policy(3);
+        let target = target(1_000);
+
+        let bucketed = policy
+            .bucketed(interval, target, BlockHeight::from_u32(1))
+            .expect("reachable");
+        let anchor = bucketed.anchor_height(target);
+        assert!(interval.is_boundary(anchor));
+        // Most recent boundary at or below 997 is 996; age 1 steps back to 984.
+        assert_eq!(u32::from(anchor), 984);
+    }
+
+    /// From NU7 activation the grid's boundaries are three times as far apart in blocks, and
+    /// bucketing steps back one boundary of the scaled grid.
+    #[test]
+    fn bucketing_follows_the_scaled_grid_from_nu7() {
+        let activation = 1_000_000u32;
+        let grid = AnchorGrid::new(
+            AnchorBucketInterval::ZIP_318,
+            BlockSpacing::with_nu7_activation(BlockHeight::from_u32(activation)),
+        );
+        let scaled_interval = consensus::NU7_POW_TARGET_SPACING_RATIO
+            * AnchorBucketInterval::ZIP_318.block_count().get();
+        let policy = policy(10);
+        let target = target(2_000_000);
+
+        let bucketed = policy
+            .bucketed(grid, target, BlockHeight::from_u32(1))
+            .expect("reachable");
+        let anchor = u32::from(bucketed.anchor_height(target));
+        let most_recent = u32::from(grid.boundary_at_or_below(policy.anchor_height(target)));
+        assert_eq!(most_recent % scaled_interval, 0);
+        assert_eq!(anchor, most_recent - scaled_interval);
+    }
 }

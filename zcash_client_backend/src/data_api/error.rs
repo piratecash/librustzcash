@@ -1,21 +1,22 @@
 //! Types for wallet error handling.
 
-use std::collections::HashMap;
-use std::error;
-use std::fmt::{self, Debug, Display};
-use std::hash::Hash;
+use std::{
+    collections::HashMap,
+    error,
+    fmt::{self, Debug, Display, Write},
+    hash::Hash,
+};
 
 use shardtree::error::ShardTreeError;
 use zcash_address::ConversionError;
 use zcash_keys::address::UnifiedAddress;
 use zcash_primitives::transaction::builder;
-use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::{
     PoolType,
+    consensus::BlockHeight,
     value::{BalanceError, Zatoshis},
 };
 
-use crate::wallet::OutputRef;
 use crate::{
     data_api::wallet::input_selection::InputSelectorError, fees::ChangeError,
     proposal::ProposalError, wallet::NoteId,
@@ -26,6 +27,7 @@ use ::transparent::address::TransparentAddress;
 
 /// Errors that can occur as a consequence of wallet operations.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error<DataSourceError, CommitmentTreeError, SelectionError, FeeError, ChangeErrT, NoteRefT>
 {
     /// An error occurred retrieving data from the underlying data source
@@ -112,12 +114,30 @@ pub enum Error<DataSourceError, CommitmentTreeError, SelectionError, FeeError, C
         min_target_height: BlockHeight,
     },
 
+    /// The caller requested an expiry height for a step that is a canonical ZIP 318 crossing.
+    ///
+    /// Such a step takes its expiry from the ZIP 318 rolling window, which every crossing in the
+    /// same period shares; a caller-chosen expiry would single it out and undo the shape the
+    /// unpadded bundle and bucketed anchor were chosen to produce. Those are already fixed by the
+    /// time the transaction is built, so the conflict is reported rather than silently resolved.
+    /// Pass `None` to accept the canonical expiry.
+    ExpiryHeightConflictsWithCanonicalCrossing { requested: BlockHeight },
+
+    /// A ZIP 316 Revision 2 recipient address of the payment at the given index has
+    /// expired, or has expiry metadata that conflicts with the transaction's expiry
+    /// height. A currently-valid address should be obtained for the intended recipient.
+    RecipientAddressExpiry {
+        payment_index: usize,
+        error: AddressExpiryError,
+    },
+
     /// An error occurred while working with PCZTs.
     #[cfg(feature = "pczt")]
     Pczt(PcztError),
 }
 
 /// Errors that may occur when rewinding the wallet to a previous chain state.
+#[non_exhaustive]
 pub enum RewindError<AccountId: Hash + Eq, E> {
     /// An error occurred retrieving data from the underlying data source.
     DataSource(E),
@@ -175,6 +195,7 @@ impl<AccountId: Hash + Eq + Debug, E: error::Error + 'static> error::Error
 /// Errors that can occur while working with PCZTs.
 #[cfg(feature = "pczt")]
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum PcztError {
     /// An error occurred while building a PCZT.
     Build,
@@ -201,6 +222,72 @@ pub enum PcztError {
     Invalid(String),
 }
 
+/// The ways in which a ZIP 316 Revision 2 recipient address's expiry metadata can
+/// prevent a payment from being constructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AddressExpiryError {
+    /// The address's expiry time is earlier than the current time.
+    TimeExpired {
+        /// The address's expiry time, in seconds since the Unix epoch.
+        expiry_time: u64,
+    },
+    /// The chain has advanced past the address's expiry height.
+    HeightExpired {
+        /// The address's expiry height.
+        address_expiry: BlockHeight,
+        /// The height of the chain tip against which expiry was evaluated.
+        chain_height: BlockHeight,
+    },
+    /// The transaction's expiry height would exceed the address's expiry height.
+    ///
+    /// ZIP 316 forbids sending in this case rather than lowering the transaction's
+    /// expiry height to match, since an expiry height derived from the address's
+    /// metadata would leak information about the destination on chain.
+    ExpiryHeightConflict {
+        address_expiry: BlockHeight,
+        transaction_expiry: BlockHeight,
+    },
+    /// The address defines an expiry height, which requires the transaction to carry a
+    /// nonzero expiry height, but transaction expiry was disabled.
+    TransactionExpiryDisabled { address_expiry: BlockHeight },
+}
+
+impl fmt::Display for AddressExpiryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AddressExpiryError::TimeExpired { expiry_time } => write!(
+                f,
+                "the address expired at {expiry_time} (seconds since the Unix epoch)"
+            ),
+            AddressExpiryError::HeightExpired {
+                address_expiry,
+                chain_height,
+            } => write!(
+                f,
+                "the address expired at height {address_expiry}, and the chain has \
+                 reached height {chain_height}"
+            ),
+            AddressExpiryError::ExpiryHeightConflict {
+                address_expiry,
+                transaction_expiry,
+            } => write!(
+                f,
+                "the transaction would expire at height {transaction_expiry}, after the \
+                 address's expiry height {address_expiry}"
+            ),
+            AddressExpiryError::TransactionExpiryDisabled { address_expiry } => write!(
+                f,
+                "the address expires at height {address_expiry}, which requires the \
+                 transaction to carry a nonzero expiry height, but transaction expiry \
+                 was disabled"
+            ),
+        }
+    }
+}
+
+impl error::Error for AddressExpiryError {}
+
 impl<DE, TE, SE, FE, CE, N> fmt::Display for Error<DE, TE, SE, FE, CE, N>
 where
     DE: fmt::Display,
@@ -211,8 +298,6 @@ where
     N: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use fmt::Write;
-
         match self {
             Error::DataSource(e) => {
                 write!(
@@ -315,6 +400,20 @@ where
                     "The specified transparent address was not recognized as belonging to the wallet."
                 )
             }
+            Error::ExpiryHeightConflictsWithCanonicalCrossing { requested } => write!(
+                f,
+                "An expiry height of {requested} was requested for a canonical ZIP 318 crossing, \
+                 which takes the ZIP 318 rolling expiry; pass `None` to accept it."
+            ),
+            Error::RecipientAddressExpiry {
+                payment_index,
+                error,
+            } => write!(
+                f,
+                "The recipient address of the payment at index {payment_index} cannot be \
+                 paid: {error}. Try to obtain a currently-valid address for the intended \
+                 recipient."
+            ),
             Error::ExpiryHeightBelowTargetHeight {
                 expiry_height,
                 min_target_height,
@@ -556,34 +655,4 @@ impl<E: error::Error + 'static> error::Error for FindAccountForAddressError<E> {
     }
 }
 
-/// Errors that occur when attempting to lock an output.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LockError<S> {
-    /// Wrapper for storage errors.
-    Storage(S),
-    /// The wrapped output reference was not found, or the output it refers to was already locked.
-    LockFailure(OutputRef),
-}
-
-impl<S: Display> Display for LockError<S> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LockError::Storage(e) => write!(f, "Note locking failed: {e}"),
-            LockError::LockFailure(output) => {
-                write!(
-                    f,
-                    "Lock conflict or missing output for reference {output:?}"
-                )
-            }
-        }
-    }
-}
-
-impl<S: error::Error + 'static> error::Error for LockError<S> {
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match self {
-            LockError::Storage(e) => Some(e),
-            LockError::LockFailure(_) => None,
-        }
-    }
-}
+pub use super::locking::LockError;

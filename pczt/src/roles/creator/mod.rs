@@ -13,12 +13,24 @@ use crate::{
     orchard::{Bundle as OrchardBundle, ORCHARD_SPENDS_AND_OUTPUTS_ENABLED},
 };
 
+#[cfg(feature = "zcp-builder")]
+use {
+    crate::common::FLAG_HAS_SIGHASH_SINGLE,
+    ::transparent::sighash::{SIGHASH_ANYONECANPAY, SIGHASH_SINGLE},
+    zcash_protocol::{consensus::NetworkConstants, constants::V4_TX_VERSION},
+};
+
 #[cfg(feature = "orchard")]
 use crate::orchard::bundle_version_for_revision;
 
-use zcash_protocol::consensus::BranchId;
-use zcash_protocol::constants::{
-    V5_TX_VERSION, V5_VERSION_GROUP_ID, V6_TX_VERSION, V6_VERSION_GROUP_ID, ZSA_V6_VERSION_GROUP_ID,
+#[cfg(zcash_unstable = "nutachyon")]
+use zcash_protocol::constants::{V7_TX_VERSION, V7_VERSION_GROUP_ID};
+use zcash_protocol::{
+    consensus::BranchId,
+    constants::{
+        V5_TX_VERSION, V5_VERSION_GROUP_ID, V6_TX_VERSION, V6_VERSION_GROUP_ID,
+        ZSA_V6_VERSION_GROUP_ID,
+    },
 };
 
 /// Initial flags allowing any modification.
@@ -81,7 +93,7 @@ impl Creator {
     /// The transaction version is implied by the consensus branch ID: the v6
     /// transaction format from NU6.3 onward, and the v5 format for earlier upgrades.
     /// For v5 transactions, `sapling_anchor` and `orchard_anchor` must both be
-    /// [`Option::Some`]. For v6 transactions, either anchor may be
+    /// [`Option::Some`]. For V6 and later transactions, either anchor may be
     /// [`Option::None`] and restored later.
     ///
     /// # Errors
@@ -111,8 +123,11 @@ impl Creator {
             | BranchId::Nu6
             | BranchId::Nu6_1
             | BranchId::Nu6_2 => (V5_TX_VERSION, V5_VERSION_GROUP_ID),
-            BranchId::Nu6_3 | BranchId::Nu7 => (V6_TX_VERSION, V6_VERSION_GROUP_ID),
+            BranchId::Nu6_3 => (V6_TX_VERSION, V6_VERSION_GROUP_ID),
             BranchId::Zsa => (V6_TX_VERSION, ZSA_V6_VERSION_GROUP_ID),
+            BranchId::Nu7 => (V6_TX_VERSION, V6_VERSION_GROUP_ID),
+            #[cfg(zcash_unstable = "nutachyon")]
+            BranchId::NuTachyon => (V7_TX_VERSION, V7_VERSION_GROUP_ID),
         };
 
         Ok(Self {
@@ -180,9 +195,15 @@ impl Creator {
     /// bundle.
     pub fn with_ironwood_anchor(mut self, ironwood_anchor: [u8; 32]) -> Result<Self, Error> {
         // Ironwood anchor is only valid for the Ironwood (NU6.3) V6 transaction format,
-        // not for ZSA which uses a different version group ID and carries an issue
+        // not for ZSA (NU7) which uses a different version group ID and carries an issue
         // bundle instead.
-        if self.version_group_id != V6_VERSION_GROUP_ID {
+        let supports_ironwood = match self.version_group_id {
+            V6_VERSION_GROUP_ID => true,
+            #[cfg(zcash_unstable = "nutachyon")]
+            V7_VERSION_GROUP_ID => true,
+            _ => false,
+        };
+        if !supports_ironwood {
             return Err(Error::IronwoodNotSupported);
         }
         self.ironwood_anchor = Some(ironwood_anchor);
@@ -285,17 +306,14 @@ impl Creator {
     pub fn build_from_parts<P: zcash_protocol::consensus::Parameters>(
         parts: zcash_primitives::transaction::builder::PcztParts<P>,
     ) -> Option<Pczt> {
-        use ::transparent::sighash::{SIGHASH_ANYONECANPAY, SIGHASH_SINGLE};
-        use zcash_protocol::{consensus::NetworkConstants, constants::V4_TX_VERSION};
-
-        use crate::common::FLAG_HAS_SIGHASH_SINGLE;
-
         let tx_version = match parts.version {
             zcash_primitives::transaction::TxVersion::Sprout(_)
             | zcash_primitives::transaction::TxVersion::V3 => None,
             zcash_primitives::transaction::TxVersion::V4 => Some(V4_TX_VERSION),
             zcash_primitives::transaction::TxVersion::V5 => Some(V5_TX_VERSION),
             zcash_primitives::transaction::TxVersion::V6 => Some(V6_TX_VERSION),
+            #[cfg(zcash_unstable = "nutachyon")]
+            zcash_primitives::transaction::TxVersion::V7 => Some(V7_TX_VERSION),
         }?;
 
         // Spends and outputs not modifiable.
@@ -362,9 +380,11 @@ impl Creator {
 
 #[cfg(test)]
 mod tests {
-    use zcash_protocol::consensus::BranchId;
-    use zcash_protocol::constants::{
-        V5_TX_VERSION, V5_VERSION_GROUP_ID, V6_TX_VERSION, V6_VERSION_GROUP_ID,
+    #[cfg(zcash_unstable = "nutachyon")]
+    use zcash_protocol::constants::{V7_TX_VERSION, V7_VERSION_GROUP_ID};
+    use zcash_protocol::{
+        consensus::BranchId,
+        constants::{V5_TX_VERSION, V5_VERSION_GROUP_ID, V6_TX_VERSION, V6_VERSION_GROUP_ID},
     };
 
     use super::{Creator, Error};
@@ -397,18 +417,21 @@ mod tests {
         assert_eq!(pczt.global.tx_version, V6_TX_VERSION);
         assert_eq!(pczt.global.version_group_id, V6_VERSION_GROUP_ID);
 
-        let pczt = Creator::new(
-            BranchId::Nu7.into(),
-            10_000_000,
-            133,
-            Some([0; 32]),
-            Some([0; 32]),
-        )
-        .unwrap()
-        .build()
-        .unwrap();
-        assert_eq!(pczt.global.tx_version, V6_TX_VERSION);
-        assert_eq!(pczt.global.version_group_id, V6_VERSION_GROUP_ID);
+        #[cfg(zcash_unstable = "nutachyon")]
+        {
+            let pczt = Creator::new(
+                BranchId::NuTachyon.into(),
+                10_000_000,
+                133,
+                Some([0; 32]),
+                Some([0; 32]),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+            assert_eq!(pczt.global.tx_version, V7_TX_VERSION);
+            assert_eq!(pczt.global.version_group_id, V7_VERSION_GROUP_ID);
+        }
     }
 
     #[test]

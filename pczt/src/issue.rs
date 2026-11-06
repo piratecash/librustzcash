@@ -17,7 +17,7 @@ pub struct Bundle {
     pub ik: [u8; 32],
 
     /// Pending issuance intents. These are populated before the Issuer builds
-    /// the [`IssueBundle`] and are cleared once the bundle is built.
+    /// the `IssueBundle` and are cleared once the bundle is built.
     ///
     /// Intents and actions are logically exclusive: intents represent the "what
     /// to issue" plan, and actions represent the built (or signed) bundle.
@@ -250,7 +250,7 @@ pub struct IssueNote {
 
 /// Trait to extract an `IssueBundle` from the PCZT wire format with the correct
 /// authorization type. Dispatches between [`Bundle::to_awaiting_sighash`] and
-/// [`Bundle::to_signed`] based on the [`IssueAuth`] type parameter.
+/// [`Bundle::to_signed`] based on the `IssueAuth` type parameter.
 #[cfg(feature = "orchard")]
 #[allow(dead_code)]
 pub(crate) trait FromPcztIssue: orchard::issuance::IssueAuth + Sized {

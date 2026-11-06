@@ -12,12 +12,12 @@ use orchard::{
     Action, Anchor, ValuePool,
     bundle::{Authorization, Authorized, BundleVersion, Flags},
     note::{ExtractedNoteCommitment, Nullifier, TransmittedNoteCiphertext},
-    note_encryption::OrchardDomain,
+    note_encryption::{ENC_CIPHERTEXT_SIZE, OrchardDomain},
     primitives::redpallas::{self, SigType, Signature, SpendAuth, VerificationKey},
     value::ValueCommitment,
 };
 use zcash_encoding::{Array, CompactSize, Vector};
-use zcash_note_encryption::{ENC_CIPHERTEXT_SIZE, EphemeralKeyBytes, OUT_CIPHERTEXT_SIZE};
+use zcash_note_encryption::{EphemeralKeyBytes, OUT_CIPHERTEXT_SIZE};
 use zcash_protocol::{
     consensus::{BranchId, OrchardProtocolRevision},
     value::ZatBalance,
@@ -65,6 +65,18 @@ pub const ACTION_SIZE: usize = VALUE_COMMITMENT_BYTE_SIZE
     + EPHEMERAL_KEY_BYTE_SIZE
     + ENC_CIPHERTEXT_SIZE
     + OUT_CIPHERTEXT_SIZE;
+
+/// The size in bytes of an Orchard/Ironwood spend authorization signature, as encoded
+/// separately from the action description in the bundle's `vSpendAuthSigs` array.
+pub const SPEND_AUTH_SIG_SIZE: usize = 64;
+
+/// The per-bundle overhead of an Orchard/Ironwood bundle, excluding the proof and the
+/// per-action data: flags (1) + value_balance (8) + anchor (32) + binding_sig (64) +
+/// a CompactSize prefix for the actions vector (at most 9 bytes, budgeted as 10). The
+/// proof is a fixed base plus a per-action share computed via
+/// `orchard::Proof::expected_proof_size`, so it is added at the call site rather than
+/// included here.
+pub const BUNDLE_OVERHEAD: usize = 1 + 8 + 32 + 64 + 10;
 
 pub trait MapAuth<A: Authorization, B: Authorization> {
     fn map_spend_auth(&self, s: A::SpendAuth) -> B::SpendAuth;
@@ -297,7 +309,7 @@ pub fn read_note_ciphertext<R: Read>(
 ) -> io::Result<TransmittedNoteCiphertext<OrchardDomain>> {
     use zcash_note_encryption::note_bytes::NoteBytesData;
     let mut epk_bytes = [0u8; 32];
-    let mut enc_ciphertext = NoteBytesData([0u8; 580]); // TODO: use ENC_CIPHERTEXT_SIZE constant for ZSA compat
+    let mut enc_ciphertext = NoteBytesData([0u8; orchard::note_encryption::ENC_CIPHERTEXT_SIZE]); // TODO: use ENC_CIPHERTEXT_SIZE constant for ZSA compat
     let mut out_ciphertext = [0u8; 80];
 
     reader.read_exact(&mut epk_bytes)?;
@@ -493,11 +505,11 @@ pub mod testing {
         }
     }
 
-    /// Generates Ironwood bundles for the v6 transaction format outside ZSA.
+    /// Generates Ironwood bundles for the v6 transaction format outside NU7.
     ///
     /// Unlike the Orchard v6 pool, the Ironwood pool ([`BundleVersion::ironwood_v3`]) permits
     /// cross-address transfers, so this exercises the Ironwood serialization path the Orchard
-    /// generator cannot. ZSA uses the issuance slot instead of Ironwood.
+    /// generator cannot. NU7 uses the issuance slot instead of Ironwood.
     pub fn arb_ironwood_bundle_for_branch(
         v: TxVersion,
         branch_id: BranchId,
@@ -519,7 +531,12 @@ pub mod testing {
     /// The Orchard-slot [`BundleVersion`] for a transaction version: `orchard_v3()` in v6 (where
     /// the Orchard pool forbids cross-address transfers), `orchard_v2()` otherwise.
     fn orchard_bundle_version(v: TxVersion) -> BundleVersion {
-        if matches!(v, TxVersion::V6) {
+        if match v {
+            TxVersion::V6 => true,
+            #[cfg(zcash_unstable = "nutachyon")]
+            TxVersion::V7 => true,
+            _ => false,
+        } {
             return BundleVersion::orchard_v3();
         }
         let _ = v;

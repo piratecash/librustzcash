@@ -38,7 +38,7 @@ impl super::Verifier {
         })
     }
 
-    /// Parses a ZSA Orchard bundle with the ZSA note-encryption domain and
+    /// Parses an NU7 Orchard bundle with the ZSA note-encryption domain and
     /// then verifies it in the given closure.
     #[cfg(feature = "zsa")]
     pub fn with_orchard_zsa<E, F>(self, f: F) -> Result<Self, OrchardError<E>>

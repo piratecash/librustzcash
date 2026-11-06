@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use core::mem::size_of;
 use corez::io::{self, Read, Write};
 use ff::PrimeField;
 
@@ -11,12 +12,12 @@ use ::sapling::{
         SpendDescription, SpendDescriptionV5,
     },
     note::ExtractedNoteCommitment,
-    note_encryption::Zip212Enforcement,
+    note_encryption::{ENC_CIPHERTEXT_SIZE, Zip212Enforcement},
     value::ValueCommitment,
 };
 use redjubjub::SpendAuth;
 use zcash_encoding::{Array, CompactSize, Vector};
-use zcash_note_encryption::{ENC_CIPHERTEXT_SIZE, EphemeralKeyBytes, OUT_CIPHERTEXT_SIZE};
+use zcash_note_encryption::{EphemeralKeyBytes, OUT_CIPHERTEXT_SIZE};
 use zcash_protocol::{
     consensus::{BlockHeight, NetworkUpgrade, Parameters, ZIP212_GRACE_PERIOD},
     value::ZatBalance,
@@ -25,11 +26,76 @@ use zcash_protocol::{
 use super::GROTH_PROOF_SIZE;
 use crate::transaction::Transaction;
 
+/// The size in bytes of a Sapling spend description in its v4 (pre-NU5) serialized form, as
+/// written by the internal `write_spend_v4` encoder.
+///
+/// This is the full per-spend cost on the wire in a version 4 transaction: the value
+/// commitment, the anchor, the nullifier, the randomized spending key, the Groth16 proof,
+/// and the spend authorization signature. Version 5 transactions move the proofs and
+/// authorization signatures to bundle-level fields (the v5 spend encoder writes only
+/// `cv` + `nullifier` + `rk`), so this v4 size is the conservative upper bound: dividing a
+/// per-spend byte budget by this constant yields a lower bound on the number of spends
+/// that fit within it.
+pub const SPEND_DESCRIPTION_SIZE: usize = VALUE_COMMITMENT_BYTE_SIZE
+    + ANCHOR_BYTE_SIZE
+    + NULLIFIER_BYTE_SIZE
+    + RK_BYTE_SIZE
+    + GROTH_PROOF_SIZE
+    + SPEND_AUTH_SIG_BYTE_SIZE;
+
+/// The size in bytes of a Sapling output description in its v4 (pre-NU5) serialized form, as
+/// written by the internal `write_output_v4` encoder.
+///
+/// This is the full per-output cost on the wire in a version 4 transaction: the value
+/// commitment, the extracted note commitment, the ephemeral key, the encrypted note
+/// ciphertext, the encrypted outgoing ciphertext, and the Groth16 proof. Version 5
+/// transactions move the proofs to a bundle-level field (the v5 output encoder omits the
+/// `zkproof`), so this v4 size is the conservative upper bound: dividing a per-output byte
+/// budget by this constant yields a lower bound on the number of outputs that fit within it.
+pub const OUTPUT_DESCRIPTION_SIZE: usize = VALUE_COMMITMENT_BYTE_SIZE
+    + CMU_BYTE_SIZE
+    + EPHEMERAL_KEY_BYTE_SIZE
+    + ENC_CIPHERTEXT_SIZE
+    + OUT_CIPHERTEXT_SIZE
+    + GROTH_PROOF_SIZE;
+
+/// The size in bytes of the encoding of a Sapling value commitment (a Jubjub group element).
+const VALUE_COMMITMENT_BYTE_SIZE: usize = 32;
+/// The size in bytes of the encoding of a Sapling nullifier.
+const NULLIFIER_BYTE_SIZE: usize = 32;
+/// The size in bytes of the encoding of a Sapling spend authorization key (a RedJubjub
+/// verification key).
+const RK_BYTE_SIZE: usize = 32;
+/// The size in bytes of the encoding of a Sapling spend authorization signature.
+const SPEND_AUTH_SIG_BYTE_SIZE: usize = 64;
+/// The size in bytes of the encoding of a Sapling anchor (a Jubjub base field element).
+const ANCHOR_BYTE_SIZE: usize = 32;
+/// The size in bytes of the encoding of a Sapling extracted note commitment.
+const CMU_BYTE_SIZE: usize = 32;
+/// The size in bytes of the encoding of a Sapling ephemeral key.
+const EPHEMERAL_KEY_BYTE_SIZE: usize = size_of::<EphemeralKeyBytes>();
+
+/// The per-bundle overhead of a Sapling bundle, excluding the per-spend and per-output
+/// data: CompactSize prefixes for the spends and outputs arrays (at most 9 + 9) +
+/// value_balance (8) + anchor (32) + binding_sig (64).
+pub const BUNDLE_OVERHEAD: usize = 9 + 9 + 8 + 32 + 64;
+
 /// Returns the enforcement policy for ZIP 212 at the given height.
+///
+/// The grace period ends [`ZIP212_GRACE_PERIOD`] blocks after Canopy, or at the NU5
+/// activation height if that comes first. On mainnet and testnet the grace period ended
+/// long before NU5, so the cap changes nothing there; on a network whose upgrades
+/// activate at adjacent heights (e.g. regtest) it lets ZIP 212 outputs be constructed
+/// from the start instead of after 32256 blocks, so that Sapling PCZTs can be built.
 pub fn zip212_enforcement(params: &impl Parameters, height: BlockHeight) -> Zip212Enforcement {
     if params.is_nu_active(NetworkUpgrade::Canopy, height) {
-        let grace_period_end_height =
+        let mut grace_period_end_height =
             params.activation_height(NetworkUpgrade::Canopy).unwrap() + ZIP212_GRACE_PERIOD;
+        if let Some(nu5) = params.activation_height(NetworkUpgrade::Nu5)
+            && nu5 < grace_period_end_height
+        {
+            grace_period_end_height = nu5;
+        }
 
         if height < grace_period_end_height {
             Zip212Enforcement::GracePeriod
@@ -126,7 +192,7 @@ pub fn read_base<R: Read>(mut reader: R, _field: &str) -> io::Result<jubjub::Bas
 /// Consensus rules (§4.4) & (§4.5):
 /// - Canonical encoding is enforced by the API of SaplingVerificationContext::check_spend()
 ///   and SaplingVerificationContext::check_output() due to the need to parse this into a
-///   bellman::groth16::Proof.
+///   groth16::Proof.
 /// - Proof validity is enforced in SaplingVerificationContext::check_spend()
 ///   and SaplingVerificationContext::check_output()
 pub fn read_zkproof<R: Read>(mut reader: R) -> io::Result<GrothProofBytes> {
@@ -329,8 +395,8 @@ fn read_output_v5<R: Read>(mut reader: &mut R) -> io::Result<OutputDescriptionV5
     let mut ephemeral_key = EphemeralKeyBytes([0u8; 32]);
     reader.read_exact(&mut ephemeral_key.0)?;
 
-    let mut enc_ciphertext = [0u8; 580];
-    let mut out_ciphertext = [0u8; 80];
+    let mut enc_ciphertext = [0u8; ENC_CIPHERTEXT_SIZE];
+    let mut out_ciphertext = [0u8; OUT_CIPHERTEXT_SIZE];
     reader.read_exact(&mut enc_ciphertext)?;
     reader.read_exact(&mut out_ciphertext)?;
 
@@ -657,7 +723,7 @@ pub mod testing {
     use zcash_protocol::value::{ZatBalance, testing::arb_zat_balance};
 
     prop_compose! {
-        fn arb_bundle()(
+        pub fn arb_bundle()(
             value_balance in arb_zat_balance()
         )(
             bundle in t_sap::arb_bundle(value_balance)
@@ -674,5 +740,188 @@ pub mod testing {
         } else {
             Strategy::boxed(Just(None))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+
+    use corez::io::{self, Write};
+    use proptest::prelude::*;
+
+    use super::{
+        ANCHOR_BYTE_SIZE, CMU_BYTE_SIZE, EPHEMERAL_KEY_BYTE_SIZE, GROTH_PROOF_SIZE,
+        NULLIFIER_BYTE_SIZE, OUTPUT_DESCRIPTION_SIZE, RK_BYTE_SIZE, SPEND_AUTH_SIG_BYTE_SIZE,
+        SPEND_DESCRIPTION_SIZE, VALUE_COMMITMENT_BYTE_SIZE, testing::arb_bundle, write_output_v4,
+        write_spend_v4,
+    };
+    use ff::PrimeField;
+
+    // Returns the number of bytes `write` emits.
+    fn encoded_len(write: impl FnOnce(&mut Vec<u8>) -> io::Result<()>) -> usize {
+        let mut buf = Vec::new();
+        write(&mut buf).expect("writing to a Vec cannot fail");
+        buf.len()
+    }
+
+    proptest! {
+        /// `SPEND_DESCRIPTION_SIZE` is what callers divide a per-spend byte budget by to bound a
+        /// spend count, so it must equal what the v4 encoder actually writes, not merely what the
+        /// constant's own arithmetic says. Measure a real spend description rather than restating
+        /// the composition, so that a change to any element's encoding fails here.
+        ///
+        /// This is also what keeps the per-element sizes honest while `sapling` exposes none of
+        /// them itself: each is checked against the encoding of the field it describes. The v4
+        /// form is used (rather than v5) because it carries every per-spend byte inline, making it
+        /// the conservative upper bound for size budgeting.
+        #[test]
+        fn spend_description_size_matches_the_encoding(
+            bundle in arb_bundle().prop_filter("bundle has spends", |b| {
+                b.as_ref().is_some_and(|b| !b.shielded_spends().is_empty())
+            }),
+        ) {
+            let bundle = bundle.unwrap();
+            let spend = &bundle.shielded_spends()[0];
+            prop_assert_eq!(
+                encoded_len(|w| write_spend_v4(w, spend)),
+                SPEND_DESCRIPTION_SIZE
+            );
+
+            // Each element, against the constant that names it.
+            prop_assert_eq!(
+                encoded_len(|w| w.write_all(&spend.cv().to_bytes())),
+                VALUE_COMMITMENT_BYTE_SIZE
+            );
+            prop_assert_eq!(
+                encoded_len(|w| w.write_all(spend.anchor().to_repr().as_ref())),
+                ANCHOR_BYTE_SIZE
+            );
+            prop_assert_eq!(
+                encoded_len(|w| w.write_all(&spend.nullifier().0)),
+                NULLIFIER_BYTE_SIZE
+            );
+            prop_assert_eq!(
+                encoded_len(|w| w.write_all(&<[u8; 32]>::from(*spend.rk()))),
+                RK_BYTE_SIZE
+            );
+            prop_assert_eq!(
+                encoded_len(|w| w.write_all(spend.zkproof())),
+                GROTH_PROOF_SIZE
+            );
+            prop_assert_eq!(
+                encoded_len(|w| w.write_all(&<[u8; 64]>::from(*spend.spend_auth_sig()))),
+                SPEND_AUTH_SIG_BYTE_SIZE
+            );
+        }
+
+        /// `OUTPUT_DESCRIPTION_SIZE` is what callers divide a per-output byte budget by to bound an
+        /// output count, so it must equal what the v4 encoder actually writes. See
+        /// `spend_description_size_matches_the_encoding` for the rationale.
+        #[test]
+        fn output_description_size_matches_the_encoding(
+            bundle in arb_bundle().prop_filter("bundle has outputs", |b| {
+                b.as_ref().is_some_and(|b| !b.shielded_outputs().is_empty())
+            }),
+        ) {
+            let bundle = bundle.unwrap();
+            let output = &bundle.shielded_outputs()[0];
+            prop_assert_eq!(
+                encoded_len(|w| write_output_v4(w, output)),
+                OUTPUT_DESCRIPTION_SIZE
+            );
+
+            // Each element, against the constant that names it.
+            prop_assert_eq!(
+                encoded_len(|w| w.write_all(&output.cv().to_bytes())),
+                VALUE_COMMITMENT_BYTE_SIZE
+            );
+            prop_assert_eq!(
+                encoded_len(|w| w.write_all(output.cmu().to_bytes().as_ref())),
+                CMU_BYTE_SIZE
+            );
+            prop_assert_eq!(
+                encoded_len(|w| w.write_all(output.ephemeral_key().as_ref())),
+                EPHEMERAL_KEY_BYTE_SIZE
+            );
+            prop_assert_eq!(
+                encoded_len(|w| w.write_all(output.zkproof())),
+                GROTH_PROOF_SIZE
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod zip212_tests {
+    use zcash_protocol::consensus::{
+        BlockHeight, MAIN_NETWORK, NetworkUpgrade, OrchardMode, Parameters, ZIP212_GRACE_PERIOD,
+    };
+    use zcash_protocol::local_consensus::LocalNetwork;
+
+    use super::zip212_enforcement;
+    use sapling::note_encryption::Zip212Enforcement;
+
+    #[test]
+    fn mainnet_grace_period_is_unchanged() {
+        let canopy = MAIN_NETWORK
+            .activation_height(NetworkUpgrade::Canopy)
+            .unwrap();
+        let end = canopy + ZIP212_GRACE_PERIOD;
+        assert_eq!(
+            zip212_enforcement(&MAIN_NETWORK, canopy - 1),
+            Zip212Enforcement::Off
+        );
+        assert_eq!(
+            zip212_enforcement(&MAIN_NETWORK, canopy),
+            Zip212Enforcement::GracePeriod
+        );
+        assert_eq!(
+            zip212_enforcement(&MAIN_NETWORK, end - 1),
+            Zip212Enforcement::GracePeriod
+        );
+        assert_eq!(
+            zip212_enforcement(&MAIN_NETWORK, end),
+            Zip212Enforcement::On
+        );
+    }
+
+    #[test]
+    fn grace_period_ends_at_nu5_when_nu5_comes_first() {
+        let h = Some(BlockHeight::from_u32(1));
+        let regtest = LocalNetwork {
+            overwinter: h,
+            sapling: h,
+            blossom: h,
+            heartwood: h,
+            canopy: h,
+            nu5: h,
+            nu6: h,
+            nu6_1: h,
+            nu6_2: h,
+            nu6_3: h,
+            zsa: None,
+            orchard_mode: OrchardMode::Normal,
+            nu7: None,
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: None,
+        };
+        assert_eq!(
+            zip212_enforcement(&regtest, BlockHeight::from_u32(1)),
+            Zip212Enforcement::On
+        );
+        // Without NU5 the grace period runs its full length.
+        let no_nu5 = LocalNetwork {
+            nu5: None,
+            ..regtest
+        };
+        assert_eq!(
+            zip212_enforcement(&no_nu5, BlockHeight::from_u32(1)),
+            Zip212Enforcement::GracePeriod
+        );
+        assert_eq!(
+            zip212_enforcement(&no_nu5, BlockHeight::from_u32(1) + ZIP212_GRACE_PERIOD),
+            Zip212Enforcement::On
+        );
     }
 }

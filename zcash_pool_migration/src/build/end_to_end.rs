@@ -7,16 +7,18 @@ use rand_chacha::ChaCha8Rng;
 use rand_core::SeedableRng;
 use zcash_protocol::value::COIN;
 
-use super::test_util::{TARGET_HEIGHT, regtest_network, single_note_witness, spending_key};
+use super::test_util::{
+    TARGET_HEIGHT, account_derivation, assert_every_spend_is_identifiable, regtest_network,
+    single_note_witness, spending_key,
+};
 use super::{build_prep_tx, build_transfer_pczt, sign_pczt};
 use zcash_primitives::transaction::fees::zip317::MARGINAL_FEE;
 use zcash_primitives::transaction::fees::{FeeRule as _, transparent, zip317};
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::Zatoshis;
+use zcash_protocol::zip318::{CROSSING_DESTINATION_ACTIONS, CROSSING_SOURCE_ACTIONS};
 
-use crate::denomination::{
-    DESTINATION_ACTIONS_PER_TRANSFER, SOURCE_ACTIONS_PER_TRANSFER, plan_denominations,
-};
+use crate::denomination::{MIGRATION_MAX_PREPARED_NOTES_PER_RUN, plan_denominations};
 use crate::preparation::{PREP_TX_ACTIONS, PrepInput, plan_preparation};
 
 /// denomination plan -> preparation plan -> build + sign a preparation transaction -> build + sign a
@@ -36,8 +38,7 @@ fn migration_pipeline_end_to_end() {
     //    the true preparation cost (via the real preparation planner) at each step.
     let prep_fee = Zatoshis::const_from_u64(PREP_TX_ACTIONS as u64 * MARGINAL_FEE.into_u64());
     let buffer = Zatoshis::const_from_u64(
-        (SOURCE_ACTIONS_PER_TRANSFER + DESTINATION_ACTIONS_PER_TRANSFER) as u64
-            * MARGINAL_FEE.into_u64(),
+        (CROSSING_SOURCE_ACTIONS + CROSSING_DESTINATION_ACTIONS) as u64 * MARGINAL_FEE.into_u64(),
     );
     let balance_zats = [Zatoshis::const_from_u64(balance)];
     let prep_tx_count = |funding: &[Zatoshis]| {
@@ -49,6 +50,8 @@ fn migration_pipeline_end_to_end() {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         plan_denominations(
             Zatoshis::const_from_u64(balance),
+            balance_zats.len(),
+            MIGRATION_MAX_PREPARED_NOTES_PER_RUN,
             buffer,
             prep_fee,
             &prep_tx_count,
@@ -71,9 +74,10 @@ fn migration_pipeline_end_to_end() {
     let tx = &prep.layers()[0][0];
     assert!(matches!(tx.inputs(), [PrepInput::Wallet { index: 0, .. }]));
     let (note, _path, _anchor) = single_note_witness(&fvk, balance, seed);
-    let prep_expiry = u32::from(crate::scheduling::expiry_height(BlockHeight::from_u32(
-        TARGET_HEIGHT,
-    )));
+    let prep_expiry = u32::from(crate::scheduling::expiry_height(
+        &crate::scheduling::BlockSpacing::UNIFORM,
+        BlockHeight::from_u32(TARGET_HEIGHT),
+    ));
     let (prep_pczt, placed) = build_prep_tx(
         &params,
         TARGET_HEIGHT,
@@ -81,6 +85,7 @@ fn migration_pipeline_end_to_end() {
         &fvk,
         vec![note],
         tx.outputs(),
+        Some(&account_derivation(seed)),
         ChaCha8Rng::seed_from_u64(seed + 1),
     )
     .expect("the preparation transaction builds");
@@ -90,6 +95,12 @@ fn migration_pipeline_end_to_end() {
         "the preparation bundle is padded to exactly 16 actions"
     );
     assert_eq!(placed.len(), tx.outputs().len(), "every output is located");
+    // Every spend the preparation transaction needs authorized is identifiable to an external
+    // Signer: the real spend plus one wallet-controlled zero-value spend per change output.
+    assert_eq!(
+        assert_every_spend_is_identifiable(&prep_pczt),
+        1 + tx.outputs().len(),
+    );
 
     // The REAL constructed preparation transaction pays exactly the canonical ZIP-317 fee of its
     // padded shape: the value its spends bring in, minus the value its outputs (including change
@@ -119,7 +130,8 @@ fn migration_pipeline_end_to_end() {
         u64::from(expected_prep_fee),
         "the built preparation transaction pays exactly the canonical fee"
     );
-    sign_pczt(prep_pczt, &ask).expect("pre-signing the preparation transaction");
+    sign_pczt(ChaCha8Rng::seed_from_u64(seed + 2), prep_pczt, &ask)
+        .expect("pre-signing the preparation transaction");
 
     // 4. Build + pre-sign a pool-crossing transfer for one funding note (witnessed directly here, as
     //    it would be once the preparation transaction is mined). It sends exactly the canonical
@@ -136,9 +148,12 @@ fn migration_pipeline_end_to_end() {
         &fvk,
         fnote,
         crossing,
+        Some(&account_derivation(seed)),
         ChaCha8Rng::seed_from_u64(seed + 3),
     )
     .expect("the transfer builds");
+    // Likewise for the transfer's single real Orchard spend.
+    assert_eq!(assert_every_spend_is_identifiable(&transfer_pczt), 1);
 
     // The REAL constructed transfer pays exactly the canonical fee of the 2-Orchard +
     // 1-Ironwood-action transfer
@@ -152,8 +167,8 @@ fn migration_pipeline_end_to_end() {
             core::iter::empty::<usize>(),
             0,
             0,
-            SOURCE_ACTIONS_PER_TRANSFER,
-            DESTINATION_ACTIONS_PER_TRANSFER,
+            CROSSING_SOURCE_ACTIONS,
+            CROSSING_DESTINATION_ACTIONS,
         )
         .expect("the canonical transfer fee computes");
     assert_eq!(
@@ -166,12 +181,12 @@ fn migration_pipeline_end_to_end() {
     let ironwood_out = bundle_output_value(transfer_pczt.ironwood());
     assert_eq!(
         transfer_pczt.orchard().actions().len(),
-        SOURCE_ACTIONS_PER_TRANSFER,
+        CROSSING_SOURCE_ACTIONS,
         "the transfer's Orchard bundle is padded to the canonical two actions"
     );
     assert_eq!(
         transfer_pczt.ironwood().actions().len(),
-        DESTINATION_ACTIONS_PER_TRANSFER,
+        CROSSING_DESTINATION_ACTIONS,
         "the transfer's Ironwood bundle is a single unpadded action"
     );
     assert_eq!(
@@ -184,7 +199,8 @@ fn migration_pipeline_end_to_end() {
         u64::from(expected_transfer_fee),
         "the built transfer pays exactly the canonical fee"
     );
-    sign_pczt(transfer_pczt, &ask).expect("pre-signing the transfer");
+    sign_pczt(ChaCha8Rng::seed_from_u64(seed + 4), transfer_pczt, &ask)
+        .expect("pre-signing the transfer");
 }
 
 /// The total output value a PCZT bundle carries (padded dummy outputs hold zero). Spend values are
