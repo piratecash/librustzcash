@@ -1350,6 +1350,7 @@ impl Authorization for TestUnauthorized {
     type TransparentAuth = TestTransparentAuth;
     type SaplingAuth = sapling::bundle::Authorized;
     type OrchardAuth = orchard::bundle::Authorized;
+    #[cfg(feature = "zsa")]
     type IssueAuth = orchard::issuance::Signed;
 }
 

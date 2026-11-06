@@ -3890,6 +3890,7 @@ where
     }
 
     #[cfg(feature = "orchard")]
+    #[cfg_attr(not(feature = "zsa"), allow(clippy::manual_map))]
     let orchard_outputs = (if let Some(bundle) = transaction
         .orchard_bundle()
         .and_then(|bundle| bundle.as_vanilla())

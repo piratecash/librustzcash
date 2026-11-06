@@ -325,13 +325,15 @@ pub mod v2 {
 
     #[cfg(test)]
     mod tests {
-        use alloc::{collections::BTreeMap, vec};
         use zcash_protocol::consensus::BranchId;
 
         use super::Pczt;
-        use crate::{
-            orchard::{Action, EncCiphertext, NoteVersion, Output, Spend},
-            roles::creator::Creator,
+        use crate::{orchard::NoteVersion, roles::creator::Creator};
+
+        #[cfg(feature = "orchard")]
+        use {
+            crate::orchard::{Action, EncCiphertext, Output, Spend},
+            alloc::{collections::BTreeMap, vec},
         };
 
         #[test]
@@ -420,6 +422,7 @@ pub mod v2 {
         }
 
         #[test]
+        #[cfg(feature = "orchard")]
         fn zsa_assets_and_note_version_survive_round_trip() {
             let spend_asset = [7; 32];
             let output_asset = [9; 32];

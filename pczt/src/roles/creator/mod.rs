@@ -356,7 +356,9 @@ impl Creator {
                     zcash_primitives::transaction::builder::OrchardPcztBundle::Zsa(bundle) => {
                         OrchardBundle::serialize_from(bundle)
                     }
+                    // Reachable only when another feature unifies `zcash_primitives/zsa` on.
                     #[cfg(not(feature = "zsa"))]
+                    #[allow(unreachable_patterns)]
                     _ => unreachable!("ZSA PCZT bundle requires the `zsa` feature"),
                 })
                 .unwrap_or(crate::orchard::EMPTY_ORCHARD),

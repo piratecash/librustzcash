@@ -2399,7 +2399,6 @@ mod tests {
                 None,
                 recipient,
                 Zatoshis::const_from_u64(10_000),
-                #[cfg(feature = "zsa")]
                 orchard::note::AssetBase::zatoshi(),
                 MemoBytes::empty(),
             ),
@@ -2517,7 +2516,6 @@ mod tests {
             .build_for_pczt(
                 UnwrapErr(SysRng),
                 &crate::transaction::fees::zip317::FeeRule::standard(),
-                #[cfg(feature = "zsa")]
                 |_| false,
             )
             .unwrap();
@@ -2559,7 +2557,6 @@ mod tests {
             builder.build_for_pczt(
                 UnwrapErr(SysRng),
                 &crate::transaction::fees::zip317::FeeRule::standard(),
-                #[cfg(feature = "zsa")]
                 |_| false,
             ),
             Err(Error::InsufficientFunds(_))
@@ -2601,7 +2598,6 @@ mod tests {
             builder.build_for_pczt(
                 UnwrapErr(SysRng),
                 &crate::transaction::fees::zip317::FeeRule::standard(),
-                #[cfg(feature = "zsa")]
                 |_| false,
             ),
             Err(Error::TargetIncompatible(
@@ -2898,7 +2894,6 @@ mod tests {
             .build_for_pczt(
                 UnwrapErr(SysRng),
                 &crate::transaction::fees::zip317::FeeRule::standard(),
-                #[cfg(feature = "zsa")]
                 |_| false,
             )
             .unwrap();
@@ -2940,7 +2935,6 @@ mod tests {
                 None,
                 recipient,
                 Zatoshis::const_from_u64(5_000),
-                #[cfg(feature = "zsa")]
                 orchard::note::AssetBase::zatoshi(),
                 MemoBytes::empty(),
             )

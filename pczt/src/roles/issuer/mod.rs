@@ -7,20 +7,22 @@
 //! - Phase 1 (after Creator): build `IssueBundle<AwaitingSighash>`, store in pczt.issue
 //! - Phase 2 (after IoFinalizer): sign with the shielded sighash
 
-use alloc::vec::Vec;
-use rand_core::Rng;
-
-use orchard::{
-    Address,
-    issuance::{
-        IssueAuth, IssueBundle,
-        auth::{IssueAuthKey, ZSASchnorr},
-    },
-    note::{ExtractedNoteCommitment, Nullifier},
-    value::NoteValue,
-};
-
 use crate::Pczt;
+
+#[cfg(feature = "zcp-builder")]
+use {
+    alloc::vec::Vec,
+    orchard::{
+        Address,
+        issuance::{
+            IssueAuth, IssueBundle,
+            auth::{IssueAuthKey, ZSASchnorr},
+        },
+        note::{ExtractedNoteCommitment, Nullifier},
+        value::NoteValue,
+    },
+    rand_core::Rng,
+};
 
 pub struct Issuer {
     pczt: Pczt,
@@ -173,12 +175,14 @@ fn build_with_zsa<R: Rng>(
 }
 
 /// Serializes any [`IssueBundle`] into the PCZT issue wire format.
+#[cfg(feature = "zcp-builder")]
 fn serialize_bundle<T: IssueAuth>(bundle: &IssueBundle<T>) -> crate::issue::Bundle {
     serialize_bundle_inner(bundle, &[])
 }
 
 /// Serializes a signed [`IssueBundle`] into the PCZT issue wire format,
 /// including the issuance authorization signature.
+#[cfg(feature = "zcp-builder")]
 fn serialize_signed_bundle(
     bundle: &IssueBundle<orchard::issuance::Signed>,
 ) -> crate::issue::Bundle {
@@ -186,6 +190,7 @@ fn serialize_signed_bundle(
     serialize_bundle_inner(bundle, &sig_bytes)
 }
 
+#[cfg(feature = "zcp-builder")]
 fn serialize_bundle_inner<T: IssueAuth>(
     bundle: &IssueBundle<T>,
     sig_bytes: &[u8],
@@ -226,6 +231,7 @@ fn serialize_bundle_inner<T: IssueAuth>(
 }
 
 /// Deserializes the PCZT issue wire format back into an `IssueBundle<AwaitingSighash>`.
+#[cfg(feature = "zcp-builder")]
 fn deserialize_bundle(
     wire: &crate::issue::Bundle,
 ) -> Option<IssueBundle<orchard::issuance::AwaitingSighash>> {
