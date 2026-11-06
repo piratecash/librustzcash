@@ -9,7 +9,6 @@ CRATES_IN_GRAPH = set([
     'eip681',
     'equihash',
     'f4jumble',
-    'payment_uri',
     'zcash_address',
     'zcash_encoding',
     'zcash_protocol',
