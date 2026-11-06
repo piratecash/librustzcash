@@ -5,7 +5,7 @@ use ::orchard::{
     note_encryption::OrchardDomain,
     tree::MerkleHashOrchard,
 };
-use incrementalmerkletree::{Hashable, Level};
+use incrementalmerkletree::{Address as TreeAddress, Hashable, Level, Position};
 use shardtree::error::ShardTreeError;
 
 use zcash_keys::{
@@ -79,6 +79,8 @@ impl ShieldedPoolTester for OrchardPoolTester {
             Some(fvk.address_at(0u32, zip32::Scope::External)),
             None,
             None,
+            None,
+            None,
         )
         .unwrap()
         .into()
@@ -109,9 +111,8 @@ impl ShieldedPoolTester for OrchardPoolTester {
         st: &mut TestState<Cache, DbT, P>,
         shard_index: u64,
     ) -> Result<Self::MerkleTreeHash, ShardTreeError<<DbT as WalletCommitmentTrees>::Error>> {
-        use incrementalmerkletree::{Address, Position};
         let shard_height = crate::data_api::ORCHARD_SHARD_HEIGHT;
-        let addr = Address::from_parts(Level::from(shard_height), shard_index);
+        let addr = TreeAddress::from_parts(Level::from(shard_height), shard_index);
         let end_position = Position::from((shard_index + 1) << shard_height);
         st.wallet_mut()
             .with_orchard_tree_mut(|tree| tree.root(addr, end_position))
@@ -182,7 +183,13 @@ impl ShieldedPoolTester for OrchardPoolTester {
         tx: &Transaction,
         fvk: &Self::Fvk,
     ) -> Option<(Note, Address, MemoBytes)> {
-        for action in tx.orchard_bundle().unwrap().actions() {
+        for action in tx
+            .orchard_bundle()
+            .unwrap()
+            .as_vanilla()
+            .expect("the Orchard test helper constructs vanilla bundles")
+            .actions()
+        {
             // Find the output that decrypts with the external OVK
             let result = try_output_recovery_with_ovk(
                 &OrchardDomain::for_action(action),
@@ -199,7 +206,7 @@ impl ShieldedPoolTester for OrchardPoolTester {
                             note,
                             pool: orchard::ValuePool::Orchard,
                         },
-                        UnifiedAddress::from_receivers(Some(addr), None, None)
+                        UnifiedAddress::from_receivers(Some(addr), None, None, None, None)
                             .unwrap()
                             .into(),
                         MemoBytes::from_bytes(&memo).expect("correct length"),
@@ -230,11 +237,13 @@ impl ShieldedPoolTester for OrchardPoolTester {
         usk: &UnifiedSpendingKey,
     ) -> Result<(), pczt::roles::signer::Error> {
         let sk = Self::usk_to_sk(usk);
+        use rand::{rand_core::UnwrapErr, rngs::SysRng};
+
         let ask = orchard::keys::SpendAuthorizingKey::from(sk);
 
         // Figuring out which one is for us is hard. Let's just try signing all of them!
         for index in 0.. {
-            match signer.sign_orchard(index, &ask) {
+            match signer.sign_orchard(UnwrapErr(SysRng), index, &ask) {
                 // Loop termination.
                 Err(pczt::roles::signer::Error::InvalidIndex) => break,
                 // Ignore any errors due to using the wrong key.

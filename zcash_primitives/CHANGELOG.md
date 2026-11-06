@@ -10,6 +10,110 @@ workspace.
 
 ## [Unreleased]
 
+### Changed
+- `transaction::components::sapling::zip212_enforcement` ends the ZIP 212 grace
+  period at the NU5 activation height when that comes first. Mainnet and testnet
+  are unaffected; on regtest-style networks where every upgrade activates at
+  height 1, ZIP 212 is enforced from the start so Sapling PCZTs can be built.
+- `transaction::fees::transparent::InputView::serialized_size` for a
+  `TransparentInputInfo` prices a P2PKH input spending an uncompressed-key coin
+  at its exact size (the standard 150 bytes plus the 32 extra pubkey bytes,
+  less the one byte the standard size rounds up) instead of the standard size,
+  matching what the network charges under ZIP 317. Compressed-key coins are
+  unchanged.
+
+### ZSA compatibility
+- ZSA transaction construction, serialization, transaction IDs, and signing hashes
+  use `BranchId::Zsa`; the deployed ZSA encoding is preserved independently of official NU7.
+- `TxVersion::has_zip233` takes a consensus branch ID; only the deployed ZSA V6
+  layout supports its existing header amount.
+
+## [0.31.0] - 2026-10-21
+
+### Added
+- `zcash_primitives::transaction`:
+  - `builder`:
+    - `default_tx_expiry_delta`
+    - `OVERWINTER_DEFAULT_TX_EXPIRY_DELTA`
+    - `BLOSSOM_DEFAULT_TX_EXPIRY_DELTA`
+    - `NU7_DEFAULT_TX_EXPIRY_DELTA`
+    - `Builder::expiry_height`
+  - `sighash::{PrecomputedSighashData, Zip244Error}`
+  - `{Zip143Digests, Zip244Digests}`
+- Experimental `TxVersion::V7` and `TransactionData::from_parts_v7` support
+  behind `zcash_unstable="nutachyon"`. V7 is enabled by NuTachyon and initially
+  uses the V6 transaction body and digest structure.
+
+### Changed
+- MSRV is now 1.89
+- Migrated to `bls12_381 0.9`, `ff 0.14`, `group 0.14`,
+  `incrementalmerkletree 0.9`, `jubjub 0.11`, `orchard 0.16`, `rand_core 0.10`,
+  `redjubjub 0.9`, `sapling-crypto 0.9`, `secp256k1 0.33`,
+  `zcash_note_encryption 0.5`, `zcash_protocol 0.11.0`, `zcash_script 0.6`,
+  `zcash_transparent 0.11.0`, and `zip32 0.3`.
+- `zcash_primitives::transaction::builder::Builder::{build, build_for_pczt}`
+  (and `mock_build`, behind `test-dependencies`) now require their `rng`
+  argument to implement `rand_core::Rng` in place of `rand_core::RngCore`.
+- `BranchId::Nu7` is available without a custom compiler configuration, with
+  consensus branch ID `0x77190AD9`. `TxVersion::suggested_for_branch` returns
+  `TxVersion::V6` for it, and `TxVersion::valid_in_branch` accepts `V5` and `V6`
+  transactions but not `V4` transactions under it (ZIP 2003).
+- `zcash_primitives::transaction::builder::{Builder, DeferredPcztBuilder}::new` now set
+  the default expiry height of a non-coinbase transaction to its target height plus
+  `default_tx_expiry_delta` for the consensus branch in effect at that height. The
+  delta is 120 blocks from NU7 activation onward, and 20 blocks before Blossom
+  activation; it remains 40 blocks between those upgrades. To keep a different
+  expiry, set it with `with_expiry_height`.
+- `zcash_primitives::transaction::TxDigests` is now an enum with variants
+  `Zip143(Zip143Digests)` and `Zip244(Zip244Digests)`. The struct formerly
+  named `TxDigests` is now `Zip244Digests`; its fields are private, and are
+  read through its accessor methods.
+- `zcash_primitives::transaction::txid::TxIdDigester` now produces
+  `Zip244Digests`, and `txid::to_txid` takes `&Zip244Digests` and returns
+  `Option<TxId>` (`None` if `TxVersion` is incompatible).
+
+### Removed
+- `zcash_primitives::transaction::builder::DEFAULT_TX_EXPIRY_DELTA`. Use
+  `default_tx_expiry_delta`, or `BLOSSOM_DEFAULT_TX_EXPIRY_DELTA` for the
+  pre-NU7 value.
+- `zcash_primitives::transaction::sighash::signature_hash`. Use
+  `PrecomputedSighashData::new(tx)` and call
+  `PrecomputedSighashData::signature_hash` for each input.
+- The `zcash_primitives::transaction::{sighash_v4, sighash_v5, sighash_v6}`
+  modules, including `v4_signature_hash`, `v5_signature_hash`, and
+  `v6_signature_hash`. Use `PrecomputedSighashData` instead; for a version 5 or
+  later transaction whose Sapling proofs are not serialized, construct it with
+  `PrecomputedSighashData::new_zip244`.
+
+### Fixed
+- `zcash_primitives::merkle_tree::merkle_path_from_slice` now returns an error
+  for an empty slice instead of panicking.
+
+## [0.30.1] - 2026-08-18
+
+### Added
+- `zcash_primitives::transaction::components::sapling::SPEND_DESCRIPTION_SIZE` and
+  `OUTPUT_DESCRIPTION_SIZE`, the sizes in bytes of a Sapling spend description and
+  output description in their v4 (pre-NU5) serialized forms. Each is the full
+  per-element cost on the wire in a version 4 transaction (the v5 form moves
+  proofs and signatures to bundle-level fields), so these are conservative upper
+  bounds: dividing a per-element byte budget by them yields a lower bound on the
+  number of spends or outputs that fit within that budget.
+- `zcash_primitives::transaction::components::sapling::testing::arb_bundle`, now
+  public behind the `test-dependencies` feature, generates a Sapling bundle with
+  arbitrary spends and outputs for cross-crate test strategies.
+- `zcash_primitives::transaction::components::orchard::SPEND_AUTH_SIG_SIZE` and
+  `BUNDLE_OVERHEAD`, the per-action spend authorization signature size and the
+  per-bundle overhead (excluding the proof and per-action data) for an
+  Orchard/Ironwood bundle.
+- `zcash_primitives::transaction::components::sapling::BUNDLE_OVERHEAD`, the
+  per-bundle overhead of a Sapling bundle (value balance, binding signature, and
+  CompactSize prefixes).
+- `zcash_primitives::transaction::fees::zip317::MAX_TRANSPARENT_INPUT_SIZE`,
+  `TRANSPARENT_BUNDLE_OVERHEAD`, and `TX_HEADER_SIZE`, the consensus-maximum
+  transparent input size, the transparent bundle overhead, and the fixed
+  transaction header size used in serialized-size estimation.
+
 ## [0.30.0] - 2026-07-23
 
 ### Added

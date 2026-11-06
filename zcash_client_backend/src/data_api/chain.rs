@@ -162,7 +162,7 @@ use crate::{
     data_api::WalletWrite,
     proto::compact_formats::CompactBlock,
     scanning::{
-        Nullifiers, ScanningKeys,
+        ScanBlockError, ScanningKeys, SpendIdentifiers,
         compact::{BatchRunners, scan_block_with_runners},
     },
 };
@@ -327,7 +327,7 @@ pub trait BlockSource {
 ///        BlockHeight::from_u32(1)..BlockHeight::from_u32(3),
 ///        ScanPriority::Historic,
 ///    );
-/// #    let extsk = sapling::zip32::ExtendedSpendingKey::master(&[]);
+/// #    let extsk = sapling::zip32::ExtendedSpendingKey::master(&[]).expect("the derivation path yields a valid key");
 /// #    let dfvk = extsk.to_diversifiable_full_viewing_key();
 /// #    let compact_block1 = zcash_client_backend::scanning::testing::fake_compact_block(
 /// #        1u32.into(),
@@ -625,7 +625,7 @@ pub fn scan_cached_blocks<ParamsT, DbT, BlockSourceT>(
     from_height: BlockHeight,
     from_state: &ChainState,
     limit: usize,
-) -> Result<ScanSummary, Error<DbT::Error, BlockSourceT::Error>>
+) -> Result<ScanSummary, Error<<DbT as WalletRead>::Error, BlockSourceT::Error>>
 where
     ParamsT: consensus::Parameters + Send + 'static,
     BlockSourceT: BlockSource,
@@ -641,9 +641,11 @@ where
     let scanning_keys = ScanningKeys::from_account_ufvks(account_ufvks);
     let mut runners = BatchRunners::<_, (), (), ()>::for_keys(100, &scanning_keys);
 
-    block_source.with_blocks::<_, DbT::Error>(Some(from_height), Some(limit), |block| {
-        runners.add_block(params, block).map_err(|e| e.into())
-    })?;
+    block_source.with_blocks::<_, <DbT as WalletRead>::Error>(
+        Some(from_height),
+        Some(limit),
+        |block| runners.add_block(params, block).map_err(|e| e.into()),
+    )?;
     runners.flush();
 
     let mut prior_block_metadata = if from_height > BlockHeight::from(0) {
@@ -654,25 +656,40 @@ where
         None
     };
 
-    // Get the nullifiers for the unspent notes we are tracking
-    let mut nullifiers = Nullifiers::unspent(data_db).map_err(Error::Wallet)?;
+    // Get the spend identifiers for the unspent outputs we are tracking.
+    let mut spend_ids = SpendIdentifiers::unspent(data_db).map_err(Error::Wallet)?;
+
+    // Nothing writes to the wallet until the whole batch has been scanned, so the wallet's set
+    // of transparent receivers is fixed for the duration of the scan and is resolved against a
+    // single snapshot rather than by a query per transparent output.
+    #[cfg(feature = "transparent-inputs")]
+    let transparent_receivers = data_db
+        .get_transparent_receiver_accounts()
+        .map_err(Error::Wallet)?;
 
     let mut scanned_blocks = vec![];
     let mut scan_summary = ScanSummary::for_range(from_height..from_height);
-    block_source.with_blocks::<_, DbT::Error>(
+    block_source.with_blocks::<_, <DbT as WalletRead>::Error>(
         Some(from_height),
         Some(limit),
         |block: CompactBlock| {
             scan_summary.scanned_range.end = block.height() + 1;
-            let scanned_block = scan_block_with_runners::<_, _, _, (), (), ()>(
+            let scanned_block = scan_block_with_runners::<_, _, _, (), (), (), _>(
                 params,
                 block,
                 &scanning_keys,
-                &nullifiers,
+                &spend_ids,
                 prior_block_metadata.as_ref(),
                 Some(&mut runners),
+                #[cfg(feature = "transparent-inputs")]
+                |address| {
+                    Ok::<_, <DbT as WalletRead>::Error>(transparent_receivers.get(address).copied())
+                },
             )
-            .map_err(Error::Scan)?;
+            .map_err(|e| match e {
+                ScanBlockError::Scan(e) => Error::Scan(e),
+                ScanBlockError::AddressLookup(e) => Error::Wallet(e),
+            })?;
 
             for wtx in &scanned_block.transactions {
                 scan_summary.spent_sapling_note_count += wtx.sapling_spends().len();
@@ -684,7 +701,7 @@ where
                 }
             }
 
-            nullifiers.update_with(&scanned_block);
+            spend_ids.update_with(&scanned_block);
             prior_block_metadata = Some(scanned_block.to_block_metadata());
             scanned_blocks.push(scanned_block);
 

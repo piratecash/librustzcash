@@ -10,11 +10,27 @@ workspace.
 
 ## [Unreleased]
 
-## [0.9.0-rc.1] - 2026-07-12
+## [0.10.0] - 2026-10-21
+
+### Changed
+- MSRV is now 1.89
+- Migrated to `zcash_address 0.14.0` and `zcash_protocol 0.11.0`.
+- Sprout recipients are now rejected when parsing a payment request or constructing
+  a `Payment`, as required by ZIP 321. Parsing returns the new
+  `Zip321Error::SproutRecipient` variant and `Payment::new` returns the new
+  `PaymentError::SproutAddress` variant.
+
+## [0.9.0] - 2026-08-18
 
 ### Changed
 - MSRV is now 1.88
-- Migrated to `zcash_protocol 0.10.0`, `zcash_address 0.13.0`.
+- Migrated to `zcash_protocol 0.10.5`, `zcash_address 0.13.0`.
+
+### Fixed
+- The `test-dependencies` feature now enables `zcash_address/test-dependencies`
+  and `zcash_protocol/test-dependencies`, which the strategies in
+  `zip321::testing` require. Enabling it without also enabling those features on
+  those crates directly previously failed to compile.
 
 ## [0.8.0] - 2026-06-02
 

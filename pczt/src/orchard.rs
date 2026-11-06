@@ -1,24 +1,37 @@
 //! The Orchard fields of a PCZT.
 
-use alloc::collections::BTreeMap;
-use alloc::string::String;
-use alloc::vec::Vec;
-use core::cmp::Ordering;
-use core::fmt;
+use alloc::{collections::BTreeMap, string::String, vec::Vec};
+use core::{cmp::Ordering, fmt};
 
-#[cfg(feature = "orchard")]
-use ff::PrimeField;
 use getset::Getters;
-#[cfg(feature = "orchard")]
-use orchard::bundle::BundleVersion;
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+
+// `NoteVersion` is re-exported, so it keeps its own statement.
 #[cfg(feature = "orchard")]
 pub(crate) use orchard::note::NoteVersion;
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+
 #[cfg(feature = "orchard")]
-use zcash_note_encryption::{Domain, ENC_CIPHERTEXT_SIZE, EphemeralKeyBytes, ShieldedOutput};
+use {
+    ::orchard::{
+        Address, Note, ValuePool,
+        bundle::BundleVersion,
+        note::{ExtractedNoteCommitment, Nullifier, RandomSeed, Rho},
+        note_encryption::{
+            COMPACT_NOTE_SIZE, CompactAction, IronwoodDomain, NoteCiphertextBytes, OrchardDomain,
+            OrchardNoteEncryption,
+        },
+        value::{NoteValue, ValueCommitTrapdoor, ValueCommitment},
+    },
+    ff::PrimeField,
+    zcash_note_encryption::{
+        Domain, EphemeralKeyBytes, ShieldedOutput, note_bytes::NoteBytes,
+        try_output_recovery_with_pkd_esk,
+    },
+    zcash_protocol::consensus::{BranchId, OrchardProtocolRevision},
+};
 
 use crate::{
-    common::{Global, Zip32Derivation},
+    common::{Global, SecretKeyBytes, Zip32Derivation},
     roles::combiner::{merge_map, merge_optional},
 };
 
@@ -78,7 +91,7 @@ pub struct Bundle {
     ///
     /// - This is `None` until it is set by the IO Finalizer.
     /// - The Transaction Extractor uses this to produce the binding signature.
-    pub(crate) bsk: Option<[u8; 32]>,
+    pub(crate) bsk: Option<SecretKeyBytes>,
 }
 
 /// The default Orchard bundle flags: both spends and outputs enabled (bits 0 and
@@ -150,15 +163,15 @@ impl fmt::Display for MemoPlaintextError {
 /// Carries the bundle's original wire `anchor` alongside the parsed form, so that
 /// [`Parsed::reserialize`] can restore it after an operation that does not itself
 /// change the anchor, even though parsing may have substituted a placeholder for it
-/// (see [ZIP 374: Anchors and pre-authorization](https://zips.z.cash/zip-0374#anchors-and-pre-authorization)).
+/// (see [ZIP 374: Anchors and pre-authorization](https://zips.z.cash/zip-0374#anchorsandpre-authorization)).
 #[cfg(feature = "orchard")]
-pub(crate) struct Parsed {
-    pub(crate) bundle: orchard::pczt::Bundle,
+pub(crate) struct Parsed<D: Domain = orchard::note_encryption::OrchardDomain> {
+    pub(crate) bundle: orchard::pczt::Bundle<D>,
     pub(crate) wire_anchor: Option<[u8; 32]>,
 }
 
 #[cfg(feature = "orchard")]
-impl Parsed {
+impl<D: Domain> Parsed<D> {
     /// Serializes the parsed bundle back into its wire representation, using
     /// [`Self::wire_anchor`] as the result's `anchor` in place of any placeholder
     /// substituted while parsing.
@@ -176,11 +189,13 @@ impl Parsed {
 /// Shared fixtures for hand-crafting Orchard-protocol PCZT test data.
 #[cfg(all(test, feature = "orchard"))]
 pub(crate) mod testing {
-    use alloc::collections::BTreeMap;
-
-    use pasta_curves::pallas;
-
-    use super::{Action, EncCiphertext, Output, Spend};
+    #[cfg(any(feature = "prover", all(feature = "signer", feature = "io-finalizer")))]
+    use {
+        super::{Action, EncCiphertext, Output, Spend},
+        alloc::collections::BTreeMap,
+        ff::Field,
+        pasta_curves::pallas,
+    };
 
     /// Derives a valid Orchard value commitment encoding for the given value and
     /// trapdoor, so that hand-crafted `Action`s pass the structural validity check
@@ -197,9 +212,8 @@ pub(crate) mod testing {
     /// Derives a valid, randomized `rk` encoding (a curve point, unlike an arbitrary
     /// byte string) so that hand-crafted `Spend`s pass the structural validity check
     /// applied when parsing.
+    #[cfg(any(feature = "prover", all(feature = "signer", feature = "io-finalizer")))]
     pub(crate) fn randomized_verification_key() -> [u8; 32] {
-        use ff::Field;
-
         let sk = orchard::keys::SpendingKey::from_bytes([7; 32]).unwrap();
         let ask = orchard::keys::SpendAuthorizingKey::from(&sk);
         let randomized_signing_key = ask.randomize(&pallas::Scalar::ONE);
@@ -211,6 +225,7 @@ pub(crate) mod testing {
 
     /// A structurally valid dummy Orchard action with no witness (so it is exempt
     /// from anchor-consistency checks), for use as a base in hand-crafted test PCZTs.
+    #[cfg(any(feature = "prover", all(feature = "signer", feature = "io-finalizer")))]
     pub(crate) fn dummy_action() -> Action {
         Action {
             cv_net: Some(value_commitment(0, [3; 32])),
@@ -222,12 +237,14 @@ pub(crate) mod testing {
                 value: None,
                 rho: None,
                 rseed: None,
+                rseed_split_note: None,
                 fvk: None,
                 witness: None,
                 alpha: None,
                 zip32_derivation: None,
                 dummy_sk: None,
                 proprietary: BTreeMap::new(),
+                asset: None,
             },
             output: Output {
                 cmx: Some([4; 32]),
@@ -241,6 +258,7 @@ pub(crate) mod testing {
                 zip32_derivation: None,
                 user_address: None,
                 proprietary: BTreeMap::new(),
+                asset: None,
             },
             rcv: None,
         }
@@ -339,34 +357,48 @@ fn recover_memo_plaintext_from_ciphertext_and_action(
     action: &Action,
     note_version: NoteVersion,
 ) -> Option<MemoPlaintext> {
-    use ::orchard::{
-        Address, Note,
-        note::{ExtractedNoteCommitment, Nullifier, RandomSeed, Rho},
-        note_encryption::{CompactAction, IronwoodDomain, OrchardDomain},
-        value::NoteValue,
-    };
-    use zcash_note_encryption::{COMPACT_NOTE_SIZE, try_output_recovery_with_pkd_esk};
+    // Everything else this function needs is imported at module scope; only
+    // the note-bytes container is not.
+    use orchard::note_encryption::ENC_CIPHERTEXT_SIZE;
+    use zcash_note_encryption::note_bytes::NoteBytesData;
 
     struct OutputRecoveryData {
-        cmx: [u8; 32],
+        cmx: ExtractedNoteCommitment,
         ephemeral_key: [u8; 32],
-        enc_ciphertext: [u8; ENC_CIPHERTEXT_SIZE],
+        enc_ciphertext: NoteBytesData<ENC_CIPHERTEXT_SIZE>,
     }
 
-    impl<D> ShieldedOutput<D, ENC_CIPHERTEXT_SIZE> for OutputRecoveryData
+    impl<D> ShieldedOutput<D> for OutputRecoveryData
     where
-        D: Domain<ExtractedCommitmentBytes = [u8; 32]>,
+        D: Domain<
+                ExtractedCommitment = ExtractedNoteCommitment,
+                ExtractedCommitmentBytes = [u8; 32],
+                NoteCiphertextBytes = NoteBytesData<ENC_CIPHERTEXT_SIZE>,
+                CompactNoteCiphertextBytes = NoteBytesData<COMPACT_NOTE_SIZE>,
+            >,
     {
         fn ephemeral_key(&self) -> EphemeralKeyBytes {
             EphemeralKeyBytes(self.ephemeral_key)
         }
 
-        fn cmstar_bytes(&self) -> [u8; 32] {
-            self.cmx
+        fn cmstar(&self) -> &ExtractedNoteCommitment {
+            &self.cmx
         }
 
-        fn enc_ciphertext(&self) -> &[u8; ENC_CIPHERTEXT_SIZE] {
-            &self.enc_ciphertext
+        fn cmstar_bytes(&self) -> [u8; 32] {
+            self.cmx.to_bytes()
+        }
+
+        fn enc_ciphertext(&self) -> Option<&NoteBytesData<ENC_CIPHERTEXT_SIZE>> {
+            Some(&self.enc_ciphertext)
+        }
+
+        fn enc_ciphertext_compact(&self) -> NoteBytesData<COMPACT_NOTE_SIZE> {
+            NoteBytesData(
+                self.enc_ciphertext.0[..COMPACT_NOTE_SIZE]
+                    .try_into()
+                    .unwrap(),
+            )
         }
     }
 
@@ -376,7 +408,14 @@ fn recover_memo_plaintext_from_ciphertext_and_action(
         output: &OutputRecoveryData,
     ) -> Option<MemoPlaintext>
     where
-        D: Domain<Note = Note, Memo = [u8; MEMO_SIZE], ExtractedCommitmentBytes = [u8; 32]>,
+        D: Domain<
+                Note = Note,
+                Memo = [u8; MEMO_SIZE],
+                ExtractedCommitment = ExtractedNoteCommitment,
+                ExtractedCommitmentBytes = [u8; 32],
+                NoteCiphertextBytes = NoteBytesData<ENC_CIPHERTEXT_SIZE>,
+                CompactNoteCiphertextBytes = NoteBytesData<COMPACT_NOTE_SIZE>,
+            >,
     {
         let pk_d = D::get_pk_d(note);
         let esk = D::derive_esk(note)?;
@@ -386,7 +425,7 @@ fn recover_memo_plaintext_from_ciphertext_and_action(
     }
 
     let enc_ciphertext = match &action.output.enc_ciphertext {
-        EncCiphertext::Encrypted(ciphertext) => ciphertext.as_slice().try_into().ok()?,
+        EncCiphertext::Encrypted(ciphertext) => NoteCiphertextBytes::from_slice(ciphertext)?,
         // we return None here to avoid excess sets or clone operations, as the caller need not do anything in this case.
         EncCiphertext::MemoPlaintext(_) => return None,
     };
@@ -395,9 +434,16 @@ fn recover_memo_plaintext_from_ciphertext_and_action(
     ))?;
     let rho = Option::from(Rho::from_bytes(&action.spend.nullifier))?;
     let rseed = Option::from(RandomSeed::from_bytes(*action.output.rseed.as_ref()?, &rho))?;
+    let asset = action
+        .output
+        .asset
+        .as_ref()
+        .and_then(|asset| Option::from(::orchard::note::AssetBase::from_bytes(asset)))
+        .unwrap_or_else(::orchard::note::AssetBase::zatoshi);
     let note = Option::from(Note::from_parts(
         recipient,
         NoteValue::from_raw(action.output.value?),
+        asset,
         rho,
         rseed,
         note_version,
@@ -406,10 +452,9 @@ fn recover_memo_plaintext_from_ciphertext_and_action(
     let nullifier = Option::from(Nullifier::from_bytes(&action.spend.nullifier))?;
     // Memo recovery is best-effort and should not resolve redacted fields.
     // Callers that want redacted `cmx` restored should use `resolve_fields`.
-    let cmx_bytes = action.output.cmx?;
-    let cmx = Option::from(ExtractedNoteCommitment::from_bytes(&cmx_bytes))?;
+    let cmx = Option::from(ExtractedNoteCommitment::from_bytes(&action.output.cmx?))?;
     let output = OutputRecoveryData {
-        cmx: cmx_bytes,
+        cmx,
         ephemeral_key: action.output.ephemeral_key,
         enc_ciphertext,
     };
@@ -417,7 +462,9 @@ fn recover_memo_plaintext_from_ciphertext_and_action(
         nullifier,
         cmx,
         EphemeralKeyBytes(action.output.ephemeral_key),
-        output.enc_ciphertext[..COMPACT_NOTE_SIZE].try_into().ok()?,
+        output.enc_ciphertext.0[..COMPACT_NOTE_SIZE]
+            .try_into()
+            .ok()?,
     );
 
     match note_version {
@@ -431,6 +478,10 @@ fn recover_memo_plaintext_from_ciphertext_and_action(
             &note,
             &output,
         ),
+        #[cfg(feature = "zsa")]
+        NoteVersion::V3ZSA => None,
+        #[cfg(not(feature = "zsa"))]
+        _ => None,
     }
 }
 
@@ -507,6 +558,7 @@ pub struct Action {
     ///
     /// This opens `cv` for all participants. For Signers who don't need this information,
     /// or after proofs / signatures have been applied, this can be redacted.
+    #[getset(get = "pub")]
     pub(crate) rcv: Option<[u8; 32]>,
 }
 
@@ -546,6 +598,7 @@ pub struct Spend {
     ///
     /// This exposes the input value to all participants. For Signers who don't need this
     /// information, or after signatures have been applied, this can be redacted.
+    #[getset(get = "pub")]
     pub(crate) value: Option<u64>,
 
     /// The rho value for the note being spent.
@@ -559,6 +612,11 @@ pub struct Spend {
     /// - This is set by the Constructor.
     /// - This is required by the Prover.
     pub(crate) rseed: Option<[u8; 32]>,
+
+    /// The alternate seed used to derive the nullifier of a ZSA split note.
+    ///
+    /// Presence of this field marks this as a split spend.
+    pub(crate) rseed_split_note: Option<[u8; 32]>,
 
     /// The full viewing key that received the note being spent.
     ///
@@ -591,11 +649,18 @@ pub struct Spend {
     /// - This is required by the IO Finalizer, and is cleared by it once used.
     /// - Signers MUST reject PCZTs that contain `dummy_sk` values.
     #[getset(get = "pub")]
-    pub(crate) dummy_sk: Option<[u8; 32]>,
+    pub(crate) dummy_sk: Option<SecretKeyBytes>,
 
     /// Proprietary fields related to the note being spent.
     #[getset(get = "pub")]
     pub(crate) proprietary: BTreeMap<String, Vec<u8>>,
+
+    /// The asset base of the note being spent. Required for NU7 actions,
+    /// including native ZEC; older Orchard actions may omit it.
+    ///
+    /// Required by Verifiers/Provers to reconstruct the ZSA note commitment.
+    #[getset(get = "pub")]
+    pub(crate) asset: Option<[u8; 32]>,
 }
 
 /// Information about the output part of an Orchard action.
@@ -669,13 +734,18 @@ pub struct Output {
     /// Proprietary fields related to the note being created.
     #[getset(get = "pub")]
     pub(crate) proprietary: BTreeMap<String, Vec<u8>>,
+
+    /// The asset base of the output note. Required for NU7 actions,
+    /// including native ZEC; older Orchard actions may omit it.
+    ///
+    /// Required by Provers to reconstruct the ZSA note commitment.
+    #[getset(get = "pub")]
+    pub(crate) asset: Option<[u8; 32]>,
 }
 
 /// Types for the v1 Orchard PCZT encoding.
 pub mod v1 {
-    use alloc::collections::BTreeMap;
-    use alloc::string::String;
-    use alloc::vec::Vec;
+    use alloc::{collections::BTreeMap, string::String, vec::Vec};
 
     use serde::{Deserialize, Serialize};
     use serde_with::serde_as;
@@ -692,7 +762,7 @@ pub mod v1 {
         value_sum: (u64, bool),
         anchor: [u8; 32],
         zkproof: Option<Vec<u8>>,
-        bsk: Option<[u8; 32]>,
+        bsk: Option<crate::common::SecretKeyBytes>,
     }
 
     /// Information about an Orchard action within a transaction.
@@ -717,13 +787,15 @@ pub mod v1 {
         value: Option<u64>,
         rho: Option<[u8; 32]>,
         rseed: Option<[u8; 32]>,
+        rseed_split_note: Option<[u8; 32]>,
         #[serde_as(as = "Option<[_; 96]>")]
         fvk: Option<[u8; 96]>,
         witness: Option<(u32, [[u8; 32]; 32])>,
         alpha: Option<[u8; 32]>,
         zip32_derivation: Option<Zip32Derivation>,
-        dummy_sk: Option<[u8; 32]>,
+        dummy_sk: Option<crate::common::SecretKeyBytes>,
         proprietary: BTreeMap<String, Vec<u8>>,
+        asset: Option<[u8; 32]>,
     }
 
     /// Information about the output part of an Orchard action.
@@ -742,6 +814,7 @@ pub mod v1 {
         zip32_derivation: Option<Zip32Derivation>,
         user_address: Option<String>,
         proprietary: BTreeMap<String, Vec<u8>>,
+        asset: Option<[u8; 32]>,
     }
 
     impl TryFrom<super::Bundle> for Bundle {
@@ -837,12 +910,14 @@ pub mod v1 {
                 value: spend.value,
                 rho: spend.rho,
                 rseed: spend.rseed,
+                rseed_split_note: spend.rseed_split_note,
                 fvk: spend.fvk,
                 witness: spend.witness,
                 alpha: spend.alpha,
                 zip32_derivation: spend.zip32_derivation,
                 dummy_sk: spend.dummy_sk,
                 proprietary: spend.proprietary,
+                asset: spend.asset,
             }
         }
     }
@@ -857,12 +932,14 @@ pub mod v1 {
                 value: spend.value,
                 rho: spend.rho,
                 rseed: spend.rseed,
+                rseed_split_note: spend.rseed_split_note,
                 fvk: spend.fvk,
                 witness: spend.witness,
                 alpha: spend.alpha,
                 zip32_derivation: spend.zip32_derivation,
                 dummy_sk: spend.dummy_sk,
                 proprietary: spend.proprietary,
+                asset: spend.asset,
             }
         }
     }
@@ -888,6 +965,7 @@ pub mod v1 {
                 zip32_derivation: output.zip32_derivation,
                 user_address: output.user_address,
                 proprietary: output.proprietary,
+                asset: output.asset,
             })
         }
     }
@@ -906,6 +984,7 @@ pub mod v1 {
                 zip32_derivation: output.zip32_derivation,
                 user_address: output.user_address,
                 proprietary: output.proprietary,
+                asset: output.asset,
             }
         }
     }
@@ -926,6 +1005,8 @@ pub(crate) mod v2 {
     enum SerializedNoteVersion {
         V2,
         V3,
+        #[cfg(feature = "orchard")]
+        V3Zsa,
     }
 
     impl From<NoteVersion> for SerializedNoteVersion {
@@ -933,6 +1014,8 @@ pub(crate) mod v2 {
             match note_version {
                 NoteVersion::V2 => Self::V2,
                 NoteVersion::V3 => Self::V3,
+                #[cfg(feature = "orchard")]
+                NoteVersion::V3ZSA => Self::V3Zsa,
             }
         }
     }
@@ -942,6 +1025,8 @@ pub(crate) mod v2 {
             match note_version {
                 SerializedNoteVersion::V2 => Self::V2,
                 SerializedNoteVersion::V3 => Self::V3,
+                #[cfg(feature = "orchard")]
+                SerializedNoteVersion::V3Zsa => Self::V3ZSA,
             }
         }
     }
@@ -955,7 +1040,7 @@ pub(crate) mod v2 {
         anchor: Option<[u8; 32]>,
         note_version: SerializedNoteVersion,
         zkproof: Option<Vec<u8>>,
-        bsk: Option<[u8; 32]>,
+        bsk: Option<crate::common::SecretKeyBytes>,
     }
 
     /// Information about an Orchard action within a transaction.
@@ -982,13 +1067,15 @@ pub(crate) mod v2 {
         value: Option<u64>,
         rho: Option<[u8; 32]>,
         rseed: Option<[u8; 32]>,
+        rseed_split_note: Option<[u8; 32]>,
         #[serde_as(as = "Option<[_; 96]>")]
         fvk: Option<[u8; 96]>,
         witness: Option<(u32, [[u8; 32]; 32])>,
         alpha: Option<[u8; 32]>,
         zip32_derivation: Option<crate::common::Zip32Derivation>,
-        dummy_sk: Option<[u8; 32]>,
+        dummy_sk: Option<crate::common::SecretKeyBytes>,
         proprietary: BTreeMap<String, Vec<u8>>,
+        asset: Option<[u8; 32]>,
     }
 
     /// Information about the output part of an Orchard action.
@@ -1007,6 +1094,7 @@ pub(crate) mod v2 {
         zip32_derivation: Option<crate::common::Zip32Derivation>,
         user_address: Option<String>,
         proprietary: BTreeMap<String, Vec<u8>>,
+        asset: Option<[u8; 32]>,
     }
 
     impl TryFrom<super::Bundle> for Bundle {
@@ -1079,12 +1167,14 @@ pub(crate) mod v2 {
                 value: spend.value,
                 rho: spend.rho,
                 rseed: spend.rseed,
+                rseed_split_note: spend.rseed_split_note,
                 fvk: spend.fvk,
                 witness: spend.witness,
                 alpha: spend.alpha,
                 zip32_derivation: spend.zip32_derivation,
                 dummy_sk: spend.dummy_sk,
                 proprietary: spend.proprietary,
+                asset: spend.asset,
             }
         }
     }
@@ -1105,12 +1195,14 @@ pub(crate) mod v2 {
                 value: self.value,
                 rho: self.rho,
                 rseed: self.rseed,
+                rseed_split_note: self.rseed_split_note,
                 fvk: self.fvk,
                 witness: self.witness,
                 alpha: self.alpha,
                 zip32_derivation: self.zip32_derivation,
                 dummy_sk: self.dummy_sk,
                 proprietary: self.proprietary,
+                asset: self.asset,
             })
         }
     }
@@ -1129,6 +1221,7 @@ pub(crate) mod v2 {
                 zip32_derivation: output.zip32_derivation,
                 user_address: output.user_address,
                 proprietary: output.proprietary,
+                asset: output.asset,
             }
         }
     }
@@ -1147,6 +1240,7 @@ pub(crate) mod v2 {
                 zip32_derivation: output.zip32_derivation,
                 user_address: output.user_address,
                 proprietary: output.proprietary,
+                asset: output.asset,
             }
         }
     }
@@ -1181,6 +1275,20 @@ pub(crate) mod v2 {
     mod tests {
         use alloc::{collections::BTreeMap, vec::Vec};
 
+        #[cfg(feature = "orchard")]
+        use {
+            crate::roles::{creator::Creator, redactor::Redactor},
+            ::orchard::{
+                Note,
+                keys::{FullViewingKey, Scope, SpendingKey},
+                note::{ExtractedNoteCommitment, RandomSeed, Rho},
+                note_encryption::{OrchardDomain, OrchardNoteEncryption},
+                value::NoteValue,
+            },
+            zcash_note_encryption::Domain,
+            zcash_protocol::consensus::BranchId,
+        };
+
         use super::super::{
             Action as LogicalAction, Bundle as LogicalBundle, EMPTY_ORCHARD, EncCiphertext,
             MEMO_SIZE, MemoPlaintext, NoteVersion, ORCHARD_SPENDS_AND_OUTPUTS_ENABLED, Output,
@@ -1198,12 +1306,14 @@ pub(crate) mod v2 {
                     value: None,
                     rho: None,
                     rseed: None,
+                    rseed_split_note: None,
                     fvk: None,
                     witness: None,
                     alpha: None,
                     zip32_derivation: None,
                     dummy_sk: None,
                     proprietary: BTreeMap::new(),
+                    asset: None,
                 },
                 output: Output {
                     cmx,
@@ -1217,6 +1327,7 @@ pub(crate) mod v2 {
                     zip32_derivation: None,
                     user_address: None,
                     proprietary: BTreeMap::new(),
+                    asset: None,
                 },
                 rcv: None,
             }
@@ -1300,15 +1411,6 @@ pub(crate) mod v2 {
 
         #[cfg(feature = "orchard")]
         fn decryptable_action_with_memo(memo: [u8; MEMO_SIZE]) -> LogicalAction {
-            use ::orchard::{
-                Note,
-                keys::{FullViewingKey, Scope, SpendingKey},
-                note::{ExtractedNoteCommitment, RandomSeed, Rho},
-                note_encryption::{OrchardDomain, OrchardNoteEncryption},
-                value::NoteValue,
-            };
-            use zcash_note_encryption::Domain;
-
             let mut nullifier = [0; 32];
             nullifier[0] = 1;
             let rho = Option::from(Rho::from_bytes(&nullifier)).unwrap();
@@ -1325,6 +1427,7 @@ pub(crate) mod v2 {
             let note = Option::from(Note::from_parts(
                 recipient,
                 value,
+                ::orchard::note::AssetBase::zatoshi(),
                 rho,
                 rseed,
                 NoteVersion::V2,
@@ -1343,18 +1446,20 @@ pub(crate) mod v2 {
                     value: None,
                     rho: None,
                     rseed: None,
+                    rseed_split_note: None,
                     fvk: None,
                     witness: None,
                     alpha: None,
                     zip32_derivation: None,
                     dummy_sk: None,
                     proprietary: BTreeMap::new(),
+                    asset: None,
                 },
                 output: Output {
                     cmx: Some(ExtractedNoteCommitment::from(note.commitment()).to_bytes()),
                     ephemeral_key: OrchardDomain::epk_bytes(encryptor.epk()).0,
                     enc_ciphertext: EncCiphertext::Encrypted(
-                        encryptor.encrypt_note_plaintext().to_vec(),
+                        encryptor.encrypt_note_plaintext().as_ref().to_vec(),
                     ),
                     out_ciphertext: Vec::new(),
                     recipient: Some(recipient.to_raw_address_bytes()),
@@ -1364,18 +1469,134 @@ pub(crate) mod v2 {
                     zip32_derivation: None,
                     user_address: None,
                     proprietary: BTreeMap::new(),
+                    asset: None,
                 },
                 rcv: None,
             }
         }
 
+        /// A fabricated same-address output, of the shape [ZIP 326] requires: a
+        /// zero-valued note addressed to the spent note's own receiver, whose
+        /// `enc_ciphertext` is bytes that do not decrypt to it rather than an
+        /// encryption of the note plaintext. `recipient`, `value`, and `rseed` stay
+        /// explicit, `user_address` is absent, and the note commitment is unchanged.
+        ///
+        /// [ZIP 326]: https://zips.z.cash/zip-0326#fabricatedsame-addressoutputsandrandomizednoteciphertexts
+        #[cfg(feature = "orchard")]
+        fn fabricated_same_address_action() -> LogicalAction {
+            let mut nullifier = [0; 32];
+            nullifier[0] = 1;
+            let rho = Option::from(Rho::from_bytes(&nullifier)).unwrap();
+            let (_, rseed) = (0u8..)
+                .find_map(|i| {
+                    let mut rseed = [0; 32];
+                    rseed[0] = i;
+                    Option::from(RandomSeed::from_bytes(rseed, &rho)).map(|parsed| (rseed, parsed))
+                })
+                .unwrap();
+            let recipient = FullViewingKey::from(&SpendingKey::from_bytes([0; 32]).unwrap())
+                .address_at(0u32, Scope::External);
+            let value = NoteValue::from_raw(0);
+            let note = Option::from(Note::from_parts(
+                recipient,
+                value,
+                ::orchard::note::AssetBase::zatoshi(),
+                rho,
+                rseed,
+                NoteVersion::V2,
+            ))
+            .unwrap();
+
+            // Only the ephemeral key is taken from the encryptor; the ciphertext itself
+            // is replaced with bytes that trial-decryption cannot recover a note from.
+            let encryptor = OrchardNoteEncryption::new(None, note, [0; MEMO_SIZE]);
+            let mut enc_ciphertext = encryptor.encrypt_note_plaintext().as_ref().to_vec();
+            enc_ciphertext.fill(0xab);
+
+            LogicalAction {
+                cv_net: Some([0; 32]),
+                spend: Spend {
+                    nullifier,
+                    rk: [2; 32],
+                    spend_auth_sig: None,
+                    recipient: None,
+                    value: None,
+                    rho: None,
+                    rseed: None,
+                    fvk: None,
+                    witness: None,
+                    alpha: None,
+                    zip32_derivation: None,
+                    dummy_sk: None,
+                    proprietary: BTreeMap::new(),
+                    asset: None,
+                    rseed_split_note: None,
+                },
+                output: Output {
+                    cmx: Some(ExtractedNoteCommitment::from(note.commitment()).to_bytes()),
+                    ephemeral_key: OrchardDomain::epk_bytes(encryptor.epk()).0,
+                    enc_ciphertext: EncCiphertext::Encrypted(enc_ciphertext),
+                    out_ciphertext: Vec::new(),
+                    recipient: Some(recipient.to_raw_address_bytes()),
+                    value: Some(value.inner()),
+                    rseed: Some(*note.rseed().as_bytes()),
+                    ock: None,
+                    zip32_derivation: None,
+                    user_address: None,
+                    proprietary: BTreeMap::new(),
+                    asset: None,
+                },
+                rcv: None,
+            }
+        }
+
+        /// Compaction leaves a fabricated same-address output's randomized ciphertext
+        /// byte-identical: it cannot be decrypted, so there is no memo plaintext to
+        /// stand in for it, and re-encrypting the note would not reproduce it. The
+        /// derivable `cmx` is still compacted, since the note itself is ordinary.
+        #[cfg(feature = "orchard")]
+        #[test]
+        fn resolvable_field_compaction_retains_randomized_ciphertext() {
+            let mut action = fabricated_same_address_action();
+            let original_enc_ciphertext = action.output.enc_ciphertext.clone();
+
+            action.compact_resolvable_fields(NoteVersion::V2);
+
+            assert_eq!(action.output.enc_ciphertext, original_enc_ciphertext);
+            assert_eq!(action.output.cmx, None);
+        }
+
+        /// Resolving a bundle carrying a fabricated same-address output succeeds and
+        /// leaves the randomized ciphertext untouched, so a round trip through the
+        /// compact signer view does not corrupt it.
+        #[cfg(feature = "orchard")]
+        #[test]
+        fn resolve_fields_preserves_randomized_ciphertext() {
+            let action = fabricated_same_address_action();
+            let original_enc_ciphertext = action.output.enc_ciphertext.clone();
+            let mut bundle = LogicalBundle {
+                actions: vec![action],
+                flags: ORCHARD_SPENDS_AND_OUTPUTS_ENABLED,
+                value_sum: (0, false),
+                anchor: None,
+                note_version: NoteVersion::V2,
+                zkproof: None,
+                bsk: None,
+            };
+            bundle.actions[0].output.cmx = None;
+
+            bundle.resolve_fields().unwrap();
+
+            assert_eq!(
+                bundle.actions[0].output.enc_ciphertext,
+                original_enc_ciphertext
+            );
+            assert!(bundle.actions[0].output.cmx.is_some());
+        }
+
         #[cfg(feature = "orchard")]
         #[test]
         fn v2_round_trips_memo_plaintext_ciphertext_data() {
-            use zcash_protocol::consensus::BranchId;
-
-            use crate::{roles::creator::Creator, roles::redactor::Redactor};
-
             const HELLO_MEMO_PAYLOAD_SIZE_REDUCTION: usize = 575;
             // The serialized reduction is one byte larger because postcard uses
             // a shorter length prefix for the stripped memo plaintext.
@@ -1599,6 +1820,37 @@ pub(crate) mod v2 {
 }
 
 impl Bundle {
+    /// This bundle's sole action, or `None` if it does not have exactly one.
+    pub fn sole_action(&self) -> Option<&Action> {
+        match self.actions.as_slice() {
+            [action] => Some(action),
+            _ => None,
+        }
+    }
+
+    /// Whether every output of this bundle that carries value pays `recipient`, given as the [raw
+    /// encoding] of an Orchard payment address, which is what makes the bundle a send-to-self.
+    ///
+    /// Zero-valued padding dummies are excluded: a Constructor fabricates them to bring the bundle
+    /// up to a required action count and they pay nobody in particular, so counting them would make
+    /// every padded bundle fail. Returns `None` if any output has had the value or the recipient it
+    /// would be judged on redacted, since the question cannot then be answered rather than answered
+    /// negatively.
+    ///
+    /// [raw encoding]: https://zips.z.cash/protocol/protocol.pdf#orchardpaymentaddrencoding
+    pub fn value_carrying_outputs_all_pay(&self, recipient: &[u8; 43]) -> Option<bool> {
+        for action in &self.actions {
+            let output = &action.output;
+            if output.value? == 0 {
+                continue;
+            }
+            if &output.recipient? != recipient {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
     /// Merges this bundle with another.
     ///
     /// Returns `None` if the bundles have conflicting data.
@@ -1679,12 +1931,14 @@ impl Bundle {
                         value,
                         rho,
                         rseed,
+                        rseed_split_note,
                         fvk,
                         witness,
                         alpha,
                         zip32_derivation: spend_zip32_derivation,
                         dummy_sk,
                         proprietary: spend_proprietary,
+                        asset: spend_asset,
                     },
                 output:
                     Output {
@@ -1699,6 +1953,7 @@ impl Bundle {
                         zip32_derivation: output_zip32_derivation,
                         user_address,
                         proprietary: output_proprietary,
+                        asset: output_asset,
                     },
                 rcv,
             } = rhs;
@@ -1718,12 +1973,14 @@ impl Bundle {
                 && merge_optional(&mut lhs.spend.value, value)
                 && merge_optional(&mut lhs.spend.rho, rho)
                 && merge_optional(&mut lhs.spend.rseed, rseed)
+                && merge_optional(&mut lhs.spend.rseed_split_note, rseed_split_note)
                 && merge_optional(&mut lhs.spend.fvk, fvk)
                 && merge_optional(&mut lhs.spend.witness, witness)
                 && merge_optional(&mut lhs.spend.alpha, alpha)
                 && merge_optional(&mut lhs.spend.zip32_derivation, spend_zip32_derivation)
                 && merge_optional(&mut lhs.spend.dummy_sk, dummy_sk)
                 && merge_map(&mut lhs.spend.proprietary, spend_proprietary)
+                && merge_optional(&mut lhs.spend.asset, spend_asset)
                 && merge_optional(&mut lhs.output.cmx, cmx)
                 && merge_optional(&mut lhs.output.recipient, output_recipient)
                 && merge_optional(&mut lhs.output.value, output_value)
@@ -1732,6 +1989,7 @@ impl Bundle {
                 && merge_optional(&mut lhs.output.zip32_derivation, output_zip32_derivation)
                 && merge_optional(&mut lhs.output.user_address, user_address)
                 && merge_map(&mut lhs.output.proprietary, output_proprietary)
+                && merge_optional(&mut lhs.output.asset, output_asset)
                 && merge_optional(&mut lhs.rcv, rcv))
             {
                 return None;
@@ -1750,18 +2008,17 @@ pub(crate) fn bundle_version_for_revision(
     revision: zcash_protocol::consensus::OrchardProtocolRevision,
     pool: orchard::ValuePool,
 ) -> Option<BundleVersion> {
-    use orchard::ValuePool;
-    use zcash_protocol::consensus::OrchardProtocolRevision;
-
     match pool {
         ValuePool::Orchard => Some(match revision {
             OrchardProtocolRevision::InsecureV1 => BundleVersion::orchard_insecure_v1(),
             OrchardProtocolRevision::V2 => BundleVersion::orchard_v2(),
             OrchardProtocolRevision::V3 => BundleVersion::orchard_v3(),
+            OrchardProtocolRevision::ZSA => BundleVersion::orchard_zsa(),
         }),
         ValuePool::Ironwood => match revision {
             OrchardProtocolRevision::InsecureV1 | OrchardProtocolRevision::V2 => None,
             OrchardProtocolRevision::V3 => Some(BundleVersion::ironwood_v3()),
+            OrchardProtocolRevision::ZSA => Some(BundleVersion::ironwood_zsa()),
         },
     }
 }
@@ -1771,8 +2028,6 @@ pub(crate) fn bundle_version_for_revision(
 /// which the Orchard protocol is not supported).
 #[cfg(feature = "orchard")]
 pub(crate) fn orchard_bundle_version(global: &crate::common::Global) -> Option<BundleVersion> {
-    use zcash_protocol::consensus::BranchId;
-
     BranchId::try_from(global.consensus_branch_id)
         .ok()?
         .orchard_protocol_revision()
@@ -1788,7 +2043,7 @@ pub enum ParseError {
     /// The operation requires the bundle's `anchor` to be set, but it was absent.
     ///
     /// For a v6 transaction, an Updater can resolve this by setting the anchor; see
-    /// [ZIP 374: Anchors and pre-authorization](https://zips.z.cash/zip-0374#anchors-and-pre-authorization).
+    /// [ZIP 374: Anchors and pre-authorization](https://zips.z.cash/zip-0374#anchorsandpre-authorization).
     MissingAnchor,
     /// The bundle's remaining fields were structurally invalid.
     Bundle(orchard::pczt::ParseError),
@@ -1820,10 +2075,10 @@ pub enum AnchorConsistencyError {
 /// Zero-valued spends are skipped, as their Merkle paths are not checked by the Orchard
 /// circuit.
 ///
-/// [ZIP 374]: https://zips.z.cash/zip-0374#anchors-and-pre-authorization
+/// [ZIP 374]: https://zips.z.cash/zip-0374#anchorsandpre-authorization
 #[cfg(all(feature = "orchard", feature = "prover"))]
-pub(crate) fn verify_witnesses_root_to_anchor(
-    bundle: &orchard::pczt::Bundle,
+pub(crate) fn verify_witnesses_root_to_anchor<D: zcash_note_encryption::Domain>(
+    bundle: &orchard::pczt::Bundle<D>,
     anchor: orchard::Anchor,
 ) -> Result<(), AnchorConsistencyError> {
     for action in bundle.actions() {
@@ -1849,9 +2104,13 @@ pub(crate) fn verify_witnesses_root_to_anchor(
             .rseed()
             .ok_or(AnchorConsistencyError::IncompleteSpendData)?;
 
-        let note = orchard::Note::from_parts(recipient, *value, rho, rseed, *spend.note_version())
-            .into_option()
-            .ok_or(AnchorConsistencyError::IncompleteSpendData)?;
+        let asset = spend
+            .asset()
+            .unwrap_or_else(orchard::note::AssetBase::zatoshi);
+        let note =
+            orchard::Note::from_parts(recipient, *value, asset, rho, rseed, *spend.note_version())
+                .into_option()
+                .ok_or(AnchorConsistencyError::IncompleteSpendData)?;
         let cmx = orchard::note::ExtractedNoteCommitment::from(note.commitment());
         let computed_anchor = witness.root(cmx);
 
@@ -1870,14 +2129,7 @@ impl Output {
         &mut self,
         note_version: NoteVersion,
         spend_nullifier: [u8; 32],
-    ) -> Result<(), ::orchard::pczt::ParseError> {
-        use ::orchard::{
-            Address, Note,
-            note::{ExtractedNoteCommitment, RandomSeed, Rho},
-            pczt::ParseError,
-            value::NoteValue,
-        };
-
+    ) -> Result<(), orchard::pczt::ParseError> {
         if self.cmx.is_some() {
             return Ok(());
         }
@@ -1885,34 +2137,38 @@ impl Output {
         let recipient = Address::from_raw_address_bytes(
             self.recipient
                 .as_ref()
-                .ok_or(ParseError::InvalidExtractedNoteCommitment)?,
+                .ok_or(orchard::pczt::ParseError::InvalidExtractedNoteCommitment)?,
         )
         .into_option()
-        .ok_or(ParseError::InvalidExtractedNoteCommitment)?;
+        .ok_or(orchard::pczt::ParseError::InvalidExtractedNoteCommitment)?;
         let rho = Rho::from_bytes(&spend_nullifier)
             .into_option()
-            .ok_or(ParseError::InvalidExtractedNoteCommitment)?;
+            .ok_or(orchard::pczt::ParseError::InvalidExtractedNoteCommitment)?;
         let rseed = RandomSeed::from_bytes(
             *self
                 .rseed
                 .as_ref()
-                .ok_or(ParseError::InvalidExtractedNoteCommitment)?,
+                .ok_or(orchard::pczt::ParseError::InvalidExtractedNoteCommitment)?,
             &rho,
         )
         .into_option()
-        .ok_or(ParseError::InvalidExtractedNoteCommitment)?;
+        .ok_or(orchard::pczt::ParseError::InvalidExtractedNoteCommitment)?;
         let note = Note::from_parts(
             recipient,
             NoteValue::from_raw(
                 self.value
-                    .ok_or(ParseError::InvalidExtractedNoteCommitment)?,
+                    .ok_or(orchard::pczt::ParseError::InvalidExtractedNoteCommitment)?,
             ),
+            self.asset
+                .as_ref()
+                .and_then(|asset| Option::from(::orchard::note::AssetBase::from_bytes(asset)))
+                .unwrap_or_else(::orchard::note::AssetBase::zatoshi),
             rho,
             rseed,
             note_version,
         )
         .into_option()
-        .ok_or(ParseError::InvalidExtractedNoteCommitment)?;
+        .ok_or(orchard::pczt::ParseError::InvalidExtractedNoteCommitment)?;
 
         self.cmx = Some(ExtractedNoteCommitment::from(note.commitment()).to_bytes());
         Ok(())
@@ -1931,16 +2187,7 @@ impl Output {
         &mut self,
         note_version: NoteVersion,
         spend_nullifier: [u8; 32],
-    ) -> Result<(), ::orchard::pczt::ParseError> {
-        use ::orchard::{
-            Address, Note,
-            note::{RandomSeed, Rho},
-            note_encryption::{OrchardDomain, OrchardNoteEncryption},
-            pczt::ParseError,
-            value::NoteValue,
-        };
-        use zcash_note_encryption::Domain;
-
+    ) -> Result<(), orchard::pczt::ParseError> {
         let memo: [u8; 512] = match &self.enc_ciphertext {
             EncCiphertext::Encrypted(_) => return Ok(()),
             EncCiphertext::MemoPlaintext(memo) => memo.to_memo(),
@@ -1949,34 +2196,64 @@ impl Output {
         let recipient = Address::from_raw_address_bytes(
             self.recipient
                 .as_ref()
-                .ok_or(ParseError::InvalidRecipient)?,
+                .ok_or(orchard::pczt::ParseError::InvalidRecipient)?,
         )
         .into_option()
-        .ok_or(ParseError::InvalidRecipient)?;
+        .ok_or(orchard::pczt::ParseError::InvalidRecipient)?;
         let rho = Rho::from_bytes(&spend_nullifier)
             .into_option()
-            .ok_or(ParseError::InvalidNullifier)?;
+            .ok_or(orchard::pczt::ParseError::InvalidNullifier)?;
         let rseed = RandomSeed::from_bytes(
-            *self.rseed.as_ref().ok_or(ParseError::InvalidRandomSeed)?,
+            *self
+                .rseed
+                .as_ref()
+                .ok_or(orchard::pczt::ParseError::InvalidRandomSeed)?,
             &rho,
         )
         .into_option()
-        .ok_or(ParseError::InvalidRandomSeed)?;
+        .ok_or(orchard::pczt::ParseError::InvalidRandomSeed)?;
         let note = Note::from_parts(
             recipient,
-            NoteValue::from_raw(self.value.ok_or(ParseError::InvalidEncCiphertext)?),
+            NoteValue::from_raw(
+                self.value
+                    .ok_or(orchard::pczt::ParseError::InvalidEncCiphertext)?,
+            ),
+            self.asset
+                .as_ref()
+                .and_then(|asset| Option::from(::orchard::note::AssetBase::from_bytes(asset)))
+                .unwrap_or_else(::orchard::note::AssetBase::zatoshi),
             rho,
             rseed,
             note_version,
         )
         .into_option()
-        .ok_or(ParseError::InvalidEncCiphertext)?;
-        let encryptor = OrchardNoteEncryption::new(None, note, memo);
-        let ephemeral_key = OrchardDomain::epk_bytes(encryptor.epk()).0;
-        let enc_ciphertext = encryptor.encrypt_note_plaintext().to_vec();
+        .ok_or(orchard::pczt::ParseError::InvalidEncCiphertext)?;
+        #[cfg(feature = "zsa")]
+        let zsa_ciphertext = if note_version == NoteVersion::V3ZSA {
+            use orchard::zsa::OrchardZSADomain;
+            let encryptor =
+                zcash_note_encryption::NoteEncryption::<OrchardZSADomain>::new(None, note, memo);
+            Some((
+                OrchardZSADomain::epk_bytes(encryptor.epk()).0,
+                encryptor.encrypt_note_plaintext().as_ref().to_vec(),
+            ))
+        } else {
+            None
+        };
+        let vanilla_ciphertext = || {
+            let encryptor = OrchardNoteEncryption::new(None, note, memo);
+            (
+                OrchardDomain::epk_bytes(encryptor.epk()).0,
+                encryptor.encrypt_note_plaintext().as_ref().to_vec(),
+            )
+        };
+        #[cfg(feature = "zsa")]
+        let (ephemeral_key, enc_ciphertext) = zsa_ciphertext.unwrap_or_else(vanilla_ciphertext);
+        #[cfg(not(feature = "zsa"))]
+        let (ephemeral_key, enc_ciphertext) = vanilla_ciphertext();
 
         if ephemeral_key != self.ephemeral_key {
-            return Err(ParseError::InvalidEncCiphertext);
+            return Err(orchard::pczt::ParseError::InvalidEncCiphertext);
         }
 
         self.enc_ciphertext = EncCiphertext::Encrypted(enc_ciphertext);
@@ -1987,27 +2264,27 @@ impl Output {
 #[cfg(feature = "orchard")]
 impl Action {
     /// Recomputes `cv_net`, if this action carries it as an omitted field.
-    fn resolve_cv_net(&mut self) -> Result<(), ::orchard::pczt::ParseError> {
-        use ::orchard::{
-            pczt::ParseError,
-            value::{NoteValue, ValueCommitTrapdoor, ValueCommitment},
-        };
-
+    fn resolve_cv_net(&mut self) -> Result<(), orchard::pczt::ParseError> {
         if self.cv_net.is_some() {
             return Ok(());
         }
 
-        let spend_value: NoteValue =
-            NoteValue::from_raw(self.spend.value.ok_or(ParseError::InvalidValueCommitment)?);
+        let spend_value: NoteValue = NoteValue::from_raw(
+            self.spend
+                .value
+                .ok_or(orchard::pczt::ParseError::InvalidValueCommitment)?,
+        );
         let output_value = NoteValue::from_raw(
             self.output
                 .value
-                .ok_or(ParseError::InvalidValueCommitment)?,
+                .ok_or(orchard::pczt::ParseError::InvalidValueCommitment)?,
         );
-        let rcv =
-            ValueCommitTrapdoor::from_bytes(self.rcv.ok_or(ParseError::InvalidValueCommitment)?)
-                .into_option()
-                .ok_or(ParseError::InvalidValueCommitment)?;
+        let rcv = ValueCommitTrapdoor::from_bytes(
+            self.rcv
+                .ok_or(orchard::pczt::ParseError::InvalidValueCommitment)?,
+        )
+        .into_option()
+        .ok_or(orchard::pczt::ParseError::InvalidValueCommitment)?;
 
         self.cv_net = Some(ValueCommitment::derive(spend_value - output_value, rcv).to_bytes());
         Ok(())
@@ -2027,7 +2304,7 @@ impl Bundle {
     /// For improved efficiency, callers that will pass the same bundle through
     /// multiple roles should call this once up front, not in each role. Parsing
     /// also resolves fields defensively.
-    pub fn resolve_fields(&mut self) -> Result<(), ::orchard::pczt::ParseError> {
+    pub fn resolve_fields(&mut self) -> Result<(), orchard::pczt::ParseError> {
         for action in &mut self.actions {
             action.resolve_cv_net()?;
             action
@@ -2076,7 +2353,25 @@ impl Bundle {
         bundle_version: BundleVersion,
         anchor_requirement: crate::common::AnchorRequirement,
     ) -> Result<Parsed, ParseError> {
-        self.into_parsed_inner(bundle_version, anchor_requirement, false)
+        self.into_parsed_inner::<orchard::note_encryption::OrchardDomain>(
+            bundle_version,
+            anchor_requirement,
+            false,
+        )
+    }
+
+    /// Parses this bundle using the ZSA note-encryption domain.
+    #[cfg(feature = "zsa")]
+    pub(crate) fn into_parsed_with_version_zsa(
+        self,
+        bundle_version: BundleVersion,
+        anchor_requirement: crate::common::AnchorRequirement,
+    ) -> Result<Parsed<orchard::zsa::OrchardZSADomain>, ParseError> {
+        self.into_parsed_inner::<orchard::zsa::OrchardZSADomain>(
+            bundle_version,
+            anchor_requirement,
+            false,
+        )
     }
 
     /// Parses this bundle with the given bundle version for a preverified signing
@@ -2098,18 +2393,22 @@ impl Bundle {
         bundle_version: BundleVersion,
         anchor_requirement: crate::common::AnchorRequirement,
     ) -> Result<Parsed, ParseError> {
-        self.into_parsed_inner(bundle_version, anchor_requirement, true)
+        self.into_parsed_inner::<orchard::note_encryption::OrchardDomain>(
+            bundle_version,
+            anchor_requirement,
+            true,
+        )
     }
 
     /// The shared body of [`Bundle::into_parsed_with_version`] and
     /// [`Bundle::into_parsed_with_version_preverified_for_signing`]: `preverified`
     /// selects between the full parse and the preverified signing parse.
-    fn into_parsed_inner(
+    fn into_parsed_inner<D: zcash_note_encryption::Domain>(
         mut self,
         bundle_version: BundleVersion,
         anchor_requirement: crate::common::AnchorRequirement,
         preverified: bool,
-    ) -> Result<Parsed, ParseError> {
+    ) -> Result<Parsed<D>, ParseError> {
         self.resolve_fields()?;
         let wire_anchor = self.anchor;
         let anchor = anchor_requirement
@@ -2122,11 +2421,11 @@ impl Bundle {
         // This can overflow stacks of embedded signers for high action count
         // transactions.
         #[inline(never)]
-        fn parse_action_inner(
+        fn parse_action_inner<D: zcash_note_encryption::Domain>(
             mut action: Action,
             note_version: NoteVersion,
             preverified: bool,
-        ) -> Result<orchard::pczt::Action, orchard::pczt::ParseError> {
+        ) -> Result<orchard::pczt::Action<D>, orchard::pczt::ParseError> {
             let spend_zip32_derivation = action
                 .spend
                 .zip32_derivation
@@ -2135,43 +2434,29 @@ impl Bundle {
                 })
                 .transpose()?;
             let spend_nullifier = action.spend.nullifier;
-
-            let spend = if preverified {
-                orchard::pczt::Spend::parse_preverified_for_signing(
-                    action.spend.nullifier,
-                    action.spend.rk,
-                    action.spend.spend_auth_sig,
-                    action.spend.recipient,
-                    action.spend.value,
-                    action.spend.rho,
-                    action.spend.rseed,
-                    action.spend.fvk,
-                    action.spend.witness,
-                    action.spend.alpha,
-                    spend_zip32_derivation,
-                    action.spend.dummy_sk,
-                    note_version,
-                    action.spend.proprietary,
-                )
+            let parse_spend = if preverified {
+                orchard::pczt::Spend::parse_preverified_for_signing
             } else {
-                orchard::pczt::Spend::parse(
-                    action.spend.nullifier,
-                    action.spend.rk,
-                    action.spend.spend_auth_sig,
-                    action.spend.recipient,
-                    action.spend.value,
-                    action.spend.rho,
-                    action.spend.rseed,
-                    action.spend.fvk,
-                    action.spend.witness,
-                    action.spend.alpha,
-                    spend_zip32_derivation,
-                    action.spend.dummy_sk,
-                    note_version,
-                    action.spend.proprietary,
-                )
-            }?;
-
+                orchard::pczt::Spend::parse
+            };
+            let spend = parse_spend(
+                action.spend.nullifier,
+                action.spend.rk,
+                action.spend.spend_auth_sig,
+                action.spend.recipient,
+                action.spend.value,
+                action.spend.rho,
+                action.spend.rseed,
+                action.spend.rseed_split_note,
+                action.spend.fvk,
+                action.spend.witness,
+                action.spend.alpha,
+                spend_zip32_derivation,
+                action.spend.dummy_sk.as_ref().map(|sk| *sk.expose_secret()),
+                note_version,
+                action.spend.proprietary,
+                action.spend.asset,
+            )?;
             action
                 .output
                 .encrypt_ciphertext_from_memo(note_version, spend_nullifier)?;
@@ -2185,7 +2470,7 @@ impl Bundle {
                 .cv_net
                 .ok_or(orchard::pczt::ParseError::InvalidValueCommitment)?;
 
-            let output = orchard::pczt::Output::parse(
+            let output = orchard::pczt::Output::<D>::parse(
                 *spend.nullifier(),
                 action
                     .output
@@ -2208,25 +2493,26 @@ impl Bundle {
                 action.output.user_address,
                 note_version,
                 action.output.proprietary,
+                action.output.asset,
             )?;
 
-            orchard::pczt::Action::parse(cv_net, spend, output, action.rcv)
+            orchard::pczt::Action::<D>::parse(cv_net, spend, output, action.rcv)
         }
 
         let note_version = self.note_version;
         let mut actions = Vec::with_capacity(self.actions.len());
         for action in self.actions {
-            actions.push(parse_action_inner(action, note_version, preverified)?);
+            actions.push(parse_action_inner::<D>(action, note_version, preverified)?);
         }
 
-        let bundle = orchard::pczt::Bundle::parse(
+        let bundle = orchard::pczt::Bundle::<D>::parse(
             actions,
             self.flags,
             bundle_version,
             self.value_sum,
             anchor,
             self.zkproof,
-            self.bsk,
+            self.bsk.as_ref().map(|bsk| *bsk.expose_secret()),
         )?;
 
         Ok(Parsed {
@@ -2235,8 +2521,9 @@ impl Bundle {
         })
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn serialize_from(bundle: orchard::pczt::Bundle) -> Self {
+    pub(crate) fn serialize_from<D: zcash_note_encryption::Domain>(
+        bundle: orchard::pczt::Bundle<D>,
+    ) -> Self {
         let note_version = bundle.bundle_version().note_version();
 
         assert!(
@@ -2295,14 +2582,17 @@ impl Bundle {
                         dummy_sk: action
                             .spend()
                             .dummy_sk()
-                            .map(|dummy_sk| *dummy_sk.to_bytes()),
+                            .as_ref()
+                            .map(|dummy_sk| SecretKeyBytes::new(*dummy_sk.to_bytes())),
                         proprietary: spend.proprietary().clone(),
+                        asset: spend.asset().map(|a| a.to_bytes()),
+                        rseed_split_note: spend.rseed_split_note().map(|rseed| *rseed.as_bytes()),
                     },
                     output: Output {
                         cmx: Some(output.cmx().to_bytes()),
                         ephemeral_key: output.encrypted_note().epk_bytes,
                         enc_ciphertext: EncCiphertext::Encrypted(
-                            output.encrypted_note().enc_ciphertext.to_vec(),
+                            output.encrypted_note().enc_ciphertext.as_ref().to_vec(),
                         ),
                         out_ciphertext: output.encrypted_note().out_ciphertext.to_vec(),
                         recipient: action
@@ -2324,6 +2614,7 @@ impl Bundle {
                         }),
                         user_address: output.user_address().clone(),
                         proprietary: output.proprietary().clone(),
+                        asset: output.asset().map(|a| a.to_bytes()),
                     },
                     rcv: action.rcv().as_ref().map(|rcv| rcv.to_bytes()),
                 }
@@ -2349,7 +2640,248 @@ impl Bundle {
                 .zkproof()
                 .as_ref()
                 .map(|zkproof| zkproof.as_ref().to_vec()),
-            bsk: bundle.bsk().as_ref().map(|bsk| bsk.into()),
+            bsk: bundle
+                .bsk()
+                .as_ref()
+                .map(|bsk| SecretKeyBytes::new(bsk.to_bytes())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use alloc::collections::BTreeMap;
+    use alloc::vec::Vec;
+
+    use proptest::prelude::*;
+    use proptest::sample::Index;
+
+    use super::{
+        Action, Bundle, EncCiphertext, NoteVersion, ORCHARD_SPENDS_AND_OUTPUTS_ENABLED, Output,
+        Spend,
+    };
+
+    /// Two distinguishable payment addresses. Only their inequality matters, so any two distinct
+    /// byte strings do; these are never parsed as addresses.
+    const OURS: [u8; 43] = [1; 43];
+    const THEIRS: [u8; 43] = [2; 43];
+
+    fn output(value: Option<u64>, recipient: Option<[u8; 43]>) -> Output {
+        Output {
+            cmx: None,
+            ephemeral_key: [0; 32],
+            enc_ciphertext: EncCiphertext::Encrypted(Vec::new()),
+            out_ciphertext: Vec::new(),
+            recipient,
+            value,
+            rseed: None,
+            ock: None,
+            zip32_derivation: None,
+            user_address: None,
+            proprietary: BTreeMap::new(),
+            asset: None,
+        }
+    }
+
+    fn spend() -> Spend {
+        Spend {
+            nullifier: [0; 32],
+            rk: [0; 32],
+            spend_auth_sig: None,
+            recipient: None,
+            value: None,
+            rho: None,
+            rseed: None,
+            fvk: None,
+            witness: None,
+            alpha: None,
+            zip32_derivation: None,
+            dummy_sk: None,
+            proprietary: BTreeMap::new(),
+            asset: None,
+            rseed_split_note: None,
+        }
+    }
+
+    /// An action carrying the given output. Neither method under test reads the spend half or any
+    /// bundle-level field, so those stay at fixed values.
+    fn action(value: Option<u64>, recipient: Option<[u8; 43]>) -> Action {
+        Action {
+            cv_net: None,
+            spend: spend(),
+            output: output(value, recipient),
+            rcv: None,
+        }
+    }
+
+    fn bundle(actions: Vec<Action>) -> Bundle {
+        Bundle {
+            actions,
+            flags: ORCHARD_SPENDS_AND_OUTPUTS_ENABLED,
+            value_sum: (0, false),
+            anchor: None,
+            note_version: NoteVersion::V2,
+            zkproof: None,
+            bsk: None,
+        }
+    }
+
+    fn arb_recipient() -> impl Strategy<Value = [u8; 43]> {
+        prop_oneof![Just(OURS), Just(THEIRS)]
+    }
+
+    /// Zero is drawn as often as any other value, because zero is what separates a padding dummy
+    /// from a real output and so is the case the predicate turns on.
+    fn arb_value() -> impl Strategy<Value = u64> {
+        prop_oneof![Just(0u64), 1u64..1_000]
+    }
+
+    /// An action whose judged fields may each have been redacted, which is the state a Redactor
+    /// can leave a PCZT in.
+    fn arb_action() -> impl Strategy<Value = Action> {
+        (
+            prop_oneof![Just(None), arb_value().prop_map(Some)],
+            prop_oneof![Just(None), arb_recipient().prop_map(Some)],
+        )
+            .prop_map(|(value, recipient)| action(value, recipient))
+    }
+
+    fn arb_bundle() -> impl Strategy<Value = Bundle> {
+        prop::collection::vec(arb_action(), 0..6).prop_map(bundle)
+    }
+
+    /// A bundle with nothing redacted, so the predicate is always able to answer.
+    fn arb_specified_bundle() -> impl Strategy<Value = Bundle> {
+        prop::collection::vec((arb_value(), arb_recipient()), 0..6).prop_map(|outputs| {
+            bundle(
+                outputs
+                    .into_iter()
+                    .map(|(value, recipient)| action(Some(value), Some(recipient)))
+                    .collect(),
+            )
+        })
+    }
+
+    /// A bundle whose value-carrying outputs all pay `OURS`, so the predicate answers
+    /// `Some(true)`. Its zero-valued dummies pay anyone: a Constructor fabricates them to reach an
+    /// action count and does not choose who they name.
+    fn arb_send_to_self_bundle() -> impl Strategy<Value = Bundle> {
+        prop::collection::vec((arb_value(), arb_recipient()), 1..6).prop_map(|outputs| {
+            bundle(
+                outputs
+                    .into_iter()
+                    .map(|(value, dummy_recipient)| {
+                        let recipient = if value == 0 { dummy_recipient } else { OURS };
+                        action(Some(value), Some(recipient))
+                    })
+                    .collect(),
+            )
+        })
+    }
+
+    proptest! {
+        #[cfg(all(feature = "orchard", feature = "zsa"))]
+        #[test]
+        fn zsa_memo_resolution_preserves_extended_ciphertext(
+            note in orchard::note::testing::arb_note(orchard::value::NoteValue::ZERO, NoteVersion::V3ZSA),
+        ) {
+            use orchard::zsa::OrchardZSADomain;
+            use zcash_note_encryption::{Domain, NoteEncryption};
+
+            let memo = [0; super::MEMO_SIZE];
+            let encryptor = NoteEncryption::<OrchardZSADomain>::new(None, note, memo);
+            let expected = encryptor.encrypt_note_plaintext().as_ref().to_vec();
+            let mut output = output(Some(note.value().inner()), Some(note.recipient().to_raw_address_bytes()));
+            output.ephemeral_key = OrchardZSADomain::epk_bytes(encryptor.epk()).0;
+            output.rseed = Some(*note.rseed().as_bytes());
+            output.asset = Some(note.asset().to_bytes());
+            output.enc_ciphertext = EncCiphertext::MemoPlaintext(super::MemoPlaintext::from_memo(memo));
+
+            output.encrypt_ciphertext_from_memo(NoteVersion::V3ZSA, note.rho().to_bytes()).unwrap();
+            prop_assert_eq!(output.enc_ciphertext, EncCiphertext::Encrypted(expected));
+        }
+
+        /// `sole_action` is about the count and nothing else.
+        #[test]
+        fn sole_action_answers_exactly_when_there_is_one_action(bundle in arb_bundle()) {
+            match bundle.sole_action() {
+                Some(action) => {
+                    prop_assert_eq!(bundle.actions.len(), 1);
+                    prop_assert_eq!(action, &bundle.actions[0]);
+                }
+                None => prop_assert_ne!(bundle.actions.len(), 1),
+            }
+        }
+
+        /// With nothing redacted the predicate is a direct reading of the outputs: every one that
+        /// carries value pays the recipient asked about.
+        #[test]
+        fn all_pay_reads_the_value_carrying_outputs(bundle in arb_specified_bundle()) {
+            let expected = bundle
+                .actions
+                .iter()
+                .all(|a| a.output.value == Some(0) || a.output.recipient == Some(OURS));
+
+            prop_assert_eq!(bundle.value_carrying_outputs_all_pay(&OURS), Some(expected));
+        }
+
+        /// Padding dummies do not participate, whoever they name and even with that name redacted.
+        /// Counting them would make every padded bundle fail, which is the whole point of the
+        /// zero-value skip.
+        #[test]
+        fn zero_valued_dummies_do_not_change_the_answer(
+            bundle in arb_bundle(),
+            dummy_recipient in prop_oneof![Just(None), arb_recipient().prop_map(Some)],
+            at in any::<Index>(),
+        ) {
+            let expected = bundle.value_carrying_outputs_all_pay(&OURS);
+
+            let mut padded = bundle.clone();
+            let at = at.index(padded.actions.len() + 1);
+            padded.actions.insert(at, action(Some(0), dummy_recipient));
+
+            prop_assert_eq!(padded.value_carrying_outputs_all_pay(&OURS), expected);
+        }
+
+        /// A redacted value leaves the question unanswered rather than answered negatively: the
+        /// output cannot even be sorted into dummy or real.
+        #[test]
+        fn a_redacted_value_is_unanswerable(bundle in arb_send_to_self_bundle(), at in any::<Index>()) {
+            prop_assert_eq!(bundle.value_carrying_outputs_all_pay(&OURS), Some(true));
+
+            let mut redacted = bundle.clone();
+            let at = at.index(redacted.actions.len());
+            redacted.actions[at].output.value = None;
+
+            prop_assert_eq!(redacted.value_carrying_outputs_all_pay(&OURS), None);
+        }
+
+        /// A redacted recipient is unanswerable only where it would have been judged: on an output
+        /// that carries value. On a dummy it is skipped before the recipient is ever read.
+        #[test]
+        fn a_redacted_recipient_is_unanswerable_only_where_it_is_judged(
+            bundle in arb_send_to_self_bundle(),
+            at in any::<Index>(),
+        ) {
+            let mut redacted = bundle.clone();
+            let at = at.index(redacted.actions.len());
+            let carries_value = redacted.actions[at].output.value != Some(0);
+            redacted.actions[at].output.recipient = None;
+
+            let expected = if carries_value { None } else { Some(true) };
+            prop_assert_eq!(redacted.value_carrying_outputs_all_pay(&OURS), expected);
+        }
+
+        /// The recipient asked about is a parameter, not a constant: the same bundle answers
+        /// differently for a recipient it does not pay.
+        #[test]
+        fn all_pay_is_asked_about_a_specific_recipient(bundle in arb_send_to_self_bundle()) {
+            let pays_nobody = bundle
+                .actions
+                .iter()
+                .all(|a| a.output.value == Some(0));
+
+            prop_assert_eq!(bundle.value_carrying_outputs_all_pay(&THEIRS), Some(pays_nobody));
         }
     }
 }

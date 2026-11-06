@@ -38,8 +38,17 @@ pub const V5_VERSION_GROUP_ID: u32 = 0x26A7270A;
 
 /// Transaction version 6, specified in [ZIP 229](https://zips.z.cash/zip-0229).
 pub const V6_TX_VERSION: u32 = 6;
-/// The version group ID for Zcash v6 transactions.
+/// The version group ID for Ironwood (NU6.3) v6 transactions.
 pub const V6_VERSION_GROUP_ID: u32 = 0xD884B698;
+/// The version group ID for ZSA (NU7) v6 transactions.
+pub const ZSA_V6_VERSION_GROUP_ID: u32 = 0x77777777;
+
+/// Transaction version 7, introduced by the NuTachyon network upgrade.
+#[cfg(zcash_unstable = "nutachyon")]
+pub const V7_TX_VERSION: u32 = 7;
+/// The placeholder version group ID for Zcash v7 transactions ("tach" in ASCII).
+#[cfg(zcash_unstable = "nutachyon")]
+pub const V7_VERSION_GROUP_ID: u32 = 0x74616368;
 
 /// The maximum size in bytes of a Zcash block, and therefore the maximum size of any single
 /// transaction within one.

@@ -10,6 +10,146 @@ workspace.
 
 ## [Unreleased]
 
+### Changed
+- The deployed ZSA protocol uses `BranchId::Zsa`, `NetworkUpgrade::Zsa`, and
+  `LocalNetwork::zsa`, preserving its existing consensus branch ID and activation rules.
+
+### Fixed
+- References to consensus parameters preserve their `OrchardMode`.
+
+## [0.11.0] - 2026-10-21
+
+This release sets the NU7 mainnet activation height to 3543405.
+
+### Added
+- `zcash_protocol::consensus::UPGRADES_IN_ORDER`
+- `zcash_protocol::consensus::NU7_POW_TARGET_SPACING_RATIO`
+- `zcash_protocol::consensus::{PRE_BLOSSOM_POW_TARGET_SPACING,
+  POST_BLOSSOM_POW_TARGET_SPACING, POST_NU7_POW_TARGET_SPACING}`
+- `zcash_protocol::consensus::{pow_target_spacing, target_time_between}`
+- `zcash_protocol::consensus::{NetworkUpgrade::Nu7, BranchId::Nu7}` and
+  `zcash_protocol::local_consensus::LocalNetwork::nu7` are now available
+  without the `--cfg zcash_unstable="nu7"` configuration flag.
+- `zcash_protocol::zip318::{AnchorGrid, BlockSpacing}`
+- `zcash_protocol::zip318::PoolMigrationConstants::anchor_grid`
+
+### Changed
+- MSRV is now 1.89
+- Migrated to `incrementalmerkletree 0.9` and `incrementalmerkletree-testing 0.4`
+  (under the `test-dependencies` feature).
+- `BranchId::height_bounds` and `height_range` now match `for_height` for local
+  schedules with skipped or out-of-order upgrades.
+- `BranchId::Nu7` now maps to and from the consensus branch ID `0x77190AD9`
+  (was the placeholder `0xFFFFFFFF`).
+- `TestNetwork` now activates NU7 at height `4465026`, and the mainnet
+  activation height has been set for `BranchId::Nu7`.
+- The ZIP 318 durations (the delay distributions, `AnchorBucketInterval`, and the
+  expiry modulus and window) are now numbers of reference blocks, which are
+  scaled by `NU7_POW_TARGET_SPACING_RATIO` at heights from NU7 activation.
+- `zcash_protocol::zip318::expiry_height` takes a `&BlockSpacing` argument, and
+  from NU7 activation uses an expiry modulus of `3 * EXPIRY_MODULUS` blocks.
+- `zcash_protocol::zip318::PoolMigrationConstants` has a new required method,
+  `block_spacing`. `canonical_expiry` and `is_canonical_expiry` use it.
+
+### Removed
+- `zcash_protocol::zip318::AnchorBucketInterval::{is_boundary,
+  boundary_at_or_below, boundary_at_or_above}`. Use the methods of the same
+  names on `AnchorGrid`.
+
+### Deprecated
+- `zcash_protocol::consensus::{SECONDS_PER_BLOCK, BLOCKS_PER_HOUR}`. The target
+  block spacing depends on the block height; use
+  `zcash_protocol::consensus::pow_target_spacing` or
+  `zcash_protocol::consensus::target_time_between` instead.
+- The address encoding prefix constants in
+  `zcash_protocol::constants::{mainnet, testnet, regtest}`. Use the constants
+  of the same names in `zcash_address::constants::{mainnet, testnet, regtest}`:
+  - `HRP_SAPLING_PAYMENT_ADDRESS`
+  - `HRP_TEX_ADDRESS`
+  - `HRP_UNIFIED_ADDRESS`, `HRP_UNIFIED_FVK`, `HRP_UNIFIED_IVK`
+  - `B58_SPROUT_ADDRESS_PREFIX`, `B58_PUBKEY_ADDRESS_PREFIX`,
+    `B58_SCRIPT_ADDRESS_PREFIX`
+- The key encoding prefix constants in
+  `zcash_protocol::constants::{mainnet, testnet, regtest}`. Use the constants
+  of the same names in `zcash_keys::constants::{mainnet, testnet, regtest}`:
+  - `HRP_SAPLING_EXTENDED_SPENDING_KEY`, `HRP_SAPLING_EXTENDED_FULL_VIEWING_KEY`
+  - `B58_SECRET_KEY_PREFIX`
+- All `zcash_protocol::consensus::NetworkConstants` methods except `coin_type`.
+  Use the functions of the same names in `zcash_address::constants` (for
+  address encodings) or `zcash_keys::constants` (for key encodings), which take
+  a `NetworkType`. A caller holding consensus parameters passes
+  `params.network_type()`.
+
+## [0.10.6] - 2026-09-04
+
+### Added
+- Experimental NuTachyon support. Every item listed here is available **only**
+  under the `--cfg zcash_unstable="nutachyon"` configuration flag, and is absent
+  from a default build:
+  - `zcash_protocol::constants::{V7_TX_VERSION, V7_VERSION_GROUP_ID}`
+  - `zcash_protocol::consensus::{NetworkUpgrade::NuTachyon, BranchId::NuTachyon}`
+  - `zcash_protocol::local_consensus::LocalNetwork::nu_tachyon`
+
+## [0.10.5] - 2026-08-18
+
+### Added
+- `TxId::as_hex`, an encoder producing the canonical byte-reversed display
+  form previously only available via `TxId`'s `Display` impl.
+- `TxId::from_hex`, parsing the canonical (byte-reversed) hexadecimal display
+  form produced by `TxId`'s `Display` impl.
+
+## [0.10.4] - 2026-08-03
+
+### Added
+- `zcash_protocol::zip318::{Zip318TxKind, Zip318Classification, Zip318Evidence,
+  classify}`, which recognize the ZIP 318 transaction shapes from evidence a
+  caller gathers. `classify` names a conformance class and never a provenance,
+  and is monotone in the evidence, so a decision it reaches is never later
+  contradicted.
+- `zcash_protocol::zip318::Zip318Classification::{to_code, from_code}`, the stable
+  integer encoding a store persists and an FFI carries. Zero means NOT CLASSIFIED
+  and is meant to be a column's default; it is distinct from the code for
+  `Nonconforming`, which is a decision.
+- `zcash_protocol::zip318::{CROSSING_SOURCE_ACTIONS, CROSSING_DESTINATION_ACTIONS}`,
+  the action counts of a canonical pool crossing.
+- `zcash_protocol::zip318::PoolMigrationConstants::{canonical_expiry, is_canonical_expiry,
+  is_canonical_expiry_value}`. The first two generalize the free `expiry_height` to an
+  overridden expiry window; the third judges an expiry without a reference height,
+  for a caller that has none and must not change its answer once it gets one.
+
+## [0.10.3] - 2026-07-29
+
+### Added
+- `zcash_protocol::zip318::{PREP_DELAY_MEAN, PREP_DELAY_CAP}`, the ZIP 318
+  preparation inter-arrival delay distribution.
+- `zcash_protocol::zip318::PoolMigrationConstants::preparation_delay`
+
+### Changed
+- `zcash_protocol::zip318::TRANSFER_DELAY_MEAN` is now 66 blocks (previously
+  144) and `zcash_protocol::zip318::ANCHOR_AGE_CAP` is now 4 boundaries
+  (previously 16), adopting the revised ZIP 318 migration timing.
+
+### Deprecated
+- `zcash_protocol::zip318::DELAY_CAP_RATIO`. ZIP 318 no longer relates each
+  delay cap to its mean by a shared ratio; use `TRANSFER_DELAY_CAP` and
+  `PREP_DELAY_CAP` directly.
+
+## [0.10.2] - 2026-07-28
+
+### Added
+- `zcash_protocol::zip318`, the ZIP 318 pool-migration protocol parameters:
+  - `DENOM_CAP`, `MAX_RESIDUAL_VALUE`, and `is_canonical_denomination`, the
+    canonical `{1, 2, 5} * 10^k` crossing denomination set and its bounds.
+  - `largest_one_two_five`, the greedy decomposition step over that set.
+  - `expiry_height`, the canonical rolling expiry window.
+  - `AnchorBucketInterval`, the grid that durable anchor checkpoints are retained
+    on and that pool-crossing transfers are anchored to.
+  - `PREP_TX_ACTIONS`, `TRANSFER_DELAY_MEAN`, `TRANSFER_DELAY_CAP`,
+    `DELAY_CAP_RATIO`, `ANCHOR_AGE_CAP`, `EXPIRY_MODULUS`, `EXPIRY_WINDOW`.
+  - `PoolMigrationConstants`, an unsealed trait carrying the above as overridable
+    parameters, every method defaulting to the ZIP 318 value. There is no
+    implementation for `NetworkType`; obtain one from the wallet.
+
 ## [0.10.1] - 2026-07-23
 
 ### Added
@@ -21,8 +161,8 @@ workspace.
   little-endian `u64` binary codec for amounts.
 - `zcash_protocol::testing::arb_txid` (behind the `test-dependencies` feature)
 - `zcash_protocol::consensus::testing::`
-  - `arb_block_height` 
-  - `arb_height_for_branch` 
+  - `arb_block_height`
+  - `arb_height_for_branch`
 
 ### Deprecated
 - `zcash_protocol::consensus::testing::arb_height` has been deprecated; use

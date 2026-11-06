@@ -12,6 +12,7 @@ impl super::Verifier {
             sapling,
             orchard,
             ironwood,
+            ..
         } = self.pczt;
 
         let bundle = transparent
@@ -27,6 +28,7 @@ impl super::Verifier {
                 sapling,
                 orchard,
                 ironwood,
+                issue: Default::default(),
             },
         })
     }

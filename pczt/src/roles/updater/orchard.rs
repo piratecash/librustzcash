@@ -14,6 +14,7 @@ impl super::Updater {
             sapling,
             orchard,
             ironwood,
+            issue,
         } = self.pczt;
         let anchor_requirement = AnchorRequirement::for_pre_authorization(global.tx_version);
 
@@ -37,6 +38,48 @@ impl super::Updater {
                 sapling,
                 orchard: parsed.reserialize(),
                 ironwood,
+                issue,
+            },
+        })
+    }
+
+    /// Updates an NU7 Orchard bundle using the ZSA note-encryption domain.
+    #[cfg(feature = "zsa")]
+    pub fn update_orchard_zsa_with<F>(self, f: F) -> Result<Self, OrchardError>
+    where
+        F: FnOnce(Updater<'_, orchard::zsa::OrchardZSADomain>) -> Result<(), UpdaterError>,
+    {
+        let Pczt {
+            global,
+            transparent,
+            sapling,
+            orchard,
+            ironwood,
+            issue,
+        } = self.pczt;
+        let anchor_requirement = AnchorRequirement::for_pre_authorization(global.tx_version);
+
+        let mut parsed = orchard
+            .into_parsed_with_version_zsa(
+                crate::orchard::orchard_bundle_version(&global)
+                    .ok_or(OrchardError::UnsupportedConsensusBranchId)?,
+                anchor_requirement,
+            )
+            .map_err(OrchardError::Parser)?;
+
+        parsed
+            .bundle
+            .update_with(f)
+            .map_err(OrchardError::Updater)?;
+
+        Ok(Self {
+            pczt: Pczt {
+                global,
+                transparent,
+                sapling,
+                orchard: parsed.reserialize(),
+                ironwood,
+                issue,
             },
         })
     }
@@ -52,6 +95,7 @@ impl super::Updater {
             sapling,
             orchard,
             ironwood,
+            issue,
         } = self.pczt;
         let anchor_requirement = AnchorRequirement::for_pre_authorization(global.tx_version);
 
@@ -71,6 +115,7 @@ impl super::Updater {
                 sapling,
                 orchard,
                 ironwood: parsed.reserialize(),
+                issue,
             },
         })
     }

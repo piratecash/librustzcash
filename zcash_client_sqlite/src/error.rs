@@ -15,10 +15,12 @@ use shardtree::error::ShardTreeError;
 use uuid::Uuid;
 use zcash_address::ParseError;
 use zcash_client_backend::data_api::NoteFilter;
+use zcash_client_backend::data_api::error::RewindError;
 use zcash_client_backend::data_api::ll;
 use zcash_client_backend::data_api::ll::wallet::PutBlocksError;
 use zcash_client_backend::wallet::OutputRef;
 use zcash_keys::address::UnifiedAddress;
+use zcash_keys::encoding::UnifiedEncodingError;
 use zcash_keys::keys::AddressGenerationError;
 use zcash_protocol::{PoolType, ShieldedPool, TxId, consensus::BlockHeight, value::BalanceError};
 use zip32::DiversifierIndex;
@@ -39,9 +41,19 @@ use {
 
 /// The primary error type for the SQLite wallet backend.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SqliteClientError {
     /// Decoding of a stored value from its serialized form has failed.
     CorruptedData(String),
+
+    /// A note commitment tree retains checkpoints both above and below a requested truncation
+    /// height, but has no checkpoint at that height.
+    DivergedCheckpoints {
+        /// The shielded pool whose note commitment tree has diverged checkpoints.
+        pool: ShieldedPool,
+        /// The requested truncation height missing from the tree's checkpoints.
+        height: BlockHeight,
+    },
 
     /// An error occurred decoding a protobuf message.
     Protobuf(prost::DecodeError),
@@ -93,6 +105,9 @@ pub enum SqliteClientError {
 
     /// An error occurred in generating a Zcash address.
     AddressGeneration(AddressGenerationError),
+
+    /// A unified address or viewing key could not be encoded for storage.
+    UnifiedEncoding(UnifiedEncodingError),
 
     /// The account for which information was requested does not belong to the wallet.
     AccountUnknown,
@@ -250,6 +265,39 @@ pub enum SqliteClientError {
     /// [`FeeRule`]: zcash_primitives::transaction::fees::FeeRule
     #[cfg(feature = "transparent-inputs")]
     FeeRuleError(Box<dyn error::Error + Send + Sync>),
+
+    /// A `zcash_client_backend` error value carried a variant that this crate has no
+    /// translation for; the wrapped value carries the error itself.
+    ///
+    /// Those error types are `#[non_exhaustive]`, so a variant introduced by a future
+    /// `zcash_client_backend` release can reach this crate before there is a specific
+    /// [`SqliteClientError`] counterpart for it. This error is therefore unreachable with
+    /// the `zcash_client_backend` release this crate is built against; encountering it
+    /// means this crate needs updating to translate the new variant.
+    BackendError(BackendError),
+}
+
+/// A `zcash_client_backend` error carrying a variant that this crate has no translation for,
+/// as reported by [`SqliteClientError::BackendError`].
+///
+/// Each variant names the operation whose error type is wrapped. The errors are boxed because
+/// both are generic over [`SqliteClientError`] itself.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum BackendError {
+    /// An error reported while inserting scanned blocks into the wallet.
+    PutBlocks(Box<PutBlocksError<SqliteClientError, commitment_tree::Error>>),
+    /// An error reported while rewinding the wallet to a previous chain state.
+    Rewind(Box<RewindError<AccountUuid, SqliteClientError>>),
+}
+
+impl fmt::Display for BackendError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            BackendError::PutBlocks(_) => write!(f, "block insertion"),
+            BackendError::Rewind(_) => write!(f, "rewind to a previous chain state"),
+        }
+    }
 }
 
 impl error::Error for SqliteClientError {
@@ -260,6 +308,7 @@ impl error::Error for SqliteClientError {
             SqliteClientError::Io(e) => Some(e),
             SqliteClientError::BalanceError(e) => Some(e),
             SqliteClientError::AddressGeneration(e) => Some(e),
+            SqliteClientError::UnifiedEncoding(e) => Some(e),
             #[cfg(feature = "orchard")]
             SqliteClientError::HistoricalFrontierInvalid(e) => Some(e),
             #[cfg(feature = "transparent-inputs")]
@@ -286,6 +335,10 @@ impl fmt::Display for SqliteClientError {
             SqliteClientError::CorruptedData(reason) => {
                 write!(f, "Data DB is corrupted: {reason}")
             }
+            SqliteClientError::DivergedCheckpoints { pool, height } => write!(
+                f,
+                "Data DB is corrupted: the {pool:?} note commitment tree retains checkpoints both above and below height {height}, but none at that height to truncate to"
+            ),
             SqliteClientError::Protobuf(e) => {
                 write!(f, "Failed to parse protobuf-encoded record: {e}")
             }
@@ -318,6 +371,7 @@ impl fmt::Display for SqliteClientError {
                 "`put_blocks` requires that the provided block range be sequential"
             ),
             SqliteClientError::AddressGeneration(e) => write!(f, "{e}"),
+            SqliteClientError::UnifiedEncoding(e) => write!(f, "{e}"),
             SqliteClientError::AccountUnknown => write!(
                 f,
                 "The account with the given ID does not belong to this wallet."
@@ -444,6 +498,11 @@ impl fmt::Display for SqliteClientError {
             }
             #[cfg(feature = "transparent-inputs")]
             SqliteClientError::FeeRuleError(e) => write!(f, "Fee rule error: {e}"),
+            SqliteClientError::BackendError(e) => write!(
+                f,
+                "The zcash_client_backend error reported for {e} is not one this version of \
+                 zcash_client_sqlite recognizes; this crate must be updated to handle it."
+            ),
         }
     }
 }
@@ -503,6 +562,12 @@ impl From<BalanceError> for SqliteClientError {
     }
 }
 
+impl From<UnifiedEncodingError> for SqliteClientError {
+    fn from(e: UnifiedEncodingError) -> Self {
+        SqliteClientError::UnifiedEncoding(e)
+    }
+}
+
 impl From<AddressGenerationError> for SqliteClientError {
     fn from(e: AddressGenerationError) -> Self {
         SqliteClientError::AddressGeneration(e)
@@ -558,6 +623,10 @@ impl From<PutBlocksError<SqliteClientError, commitment_tree::Error>> for SqliteC
             },
             #[cfg(feature = "transparent-inputs")]
             ll::wallet::PutBlocksError::GapAddresses(e) => SqliteClientError::from(e),
+            // `PutBlocksError` is `#[non_exhaustive]`, so a variant introduced by a future
+            // `zcash_client_backend` release reaches this conversion with no counterpart
+            // here until this crate is updated to map it. Report it rather than panicking.
+            other => SqliteClientError::BackendError(BackendError::PutBlocks(Box::new(other))),
         }
     }
 }

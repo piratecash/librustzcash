@@ -11,8 +11,13 @@ use std::{
 };
 use zcash_address::unified::{self, Encoding};
 
+use self::proposal::proposed_input;
+// `parse_standard_proposal` matches the input value's variants bare.
+use self::proposal::proposed_input::Value::*;
+use self::proposal::{PriorStepChange, PriorStepOutput, ReceivedOutput};
+
 use sapling::{self, Node, note::ExtractedNoteCommitment};
-use zcash_note_encryption::{COMPACT_NOTE_SIZE, EphemeralKeyBytes};
+use zcash_note_encryption::EphemeralKeyBytes;
 use zcash_primitives::{
     block::{BlockHash, BlockHeader},
     merkle_tree::read_commitment_tree,
@@ -32,7 +37,7 @@ use crate::{
         chain::ChainState,
         wallet::{ConfirmationsPolicy, TargetHeight, input_selection::LockFilter},
     },
-    fees::{ChangeValue, StandardFeeRule, TransactionBalance},
+    fees::{ChangeValue, DummyOutputCounts, StandardFeeRule, TransactionBalance},
     proposal::{
         Proposal, ProposalError, ShieldedInputs, Step, StepOutput, StepOutputIndex,
         produces_shielded_bundle,
@@ -125,6 +130,7 @@ impl compact_formats::CompactTx {
 
 /// An error indicating that a field of a compact format structure could not be parsed.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum CompactFormatError {
     /// A byte slice had an invalid length for the expected field.
     InvalidLength(TryFromSliceError),
@@ -174,7 +180,9 @@ impl<Proof> From<&sapling::bundle::OutputDescription<Proof>>
         compact_formats::CompactSaplingOutput {
             cmu: out.cmu().to_bytes().to_vec(),
             ephemeral_key: out.ephemeral_key().as_ref().to_vec(),
-            ciphertext: out.enc_ciphertext()[..COMPACT_NOTE_SIZE].to_vec(),
+            ciphertext: out.enc_ciphertext().as_ref()
+                [..sapling::note_encryption::COMPACT_NOTE_SIZE]
+                .to_vec(),
         }
     }
 }
@@ -211,6 +219,39 @@ impl compact_formats::CompactSaplingSpend {
     /// A convenience method that parses [`field@Self::nf`].
     pub fn nf(&self) -> Result<sapling::Nullifier, CompactFormatError> {
         sapling::Nullifier::from_slice(&self.nf).map_err(CompactFormatError::InvalidLength)
+    }
+}
+
+#[cfg(feature = "transparent-inputs")]
+impl compact_formats::CompactTxIn {
+    /// Returns the outpoint of the transparent output that this input spends.
+    ///
+    /// A convenience method that parses [`field@Self::prevout_txid`] and
+    /// [`field@Self::prevout_index`].
+    pub fn prevout(&self) -> Result<transparent::bundle::OutPoint, CompactFormatError> {
+        Ok(transparent::bundle::OutPoint::new(
+            self.prevout_txid[..]
+                .try_into()
+                .map_err(CompactFormatError::InvalidLength)?,
+            self.prevout_index,
+        ))
+    }
+}
+
+#[cfg(feature = "transparent-inputs")]
+impl compact_formats::TxOut {
+    /// Returns the transparent output that this message describes.
+    ///
+    /// A convenience method that parses [`field@Self::value`] and [`field@Self::script_pub_key`].
+    ///
+    /// # Errors
+    /// Returns [`CompactFormatError::InvalidValue`] if the value is not a valid amount of
+    /// zatoshis.
+    pub fn to_txout(&self) -> Result<transparent::bundle::TxOut, CompactFormatError> {
+        Ok(transparent::bundle::TxOut::new(
+            Zatoshis::from_u64(self.value).map_err(|_| CompactFormatError::InvalidValue)?,
+            transparent::address::Script(zcash_script::script::Code(self.script_pub_key.clone())),
+        ))
     }
 }
 
@@ -283,7 +324,9 @@ impl<SpendAuth> From<&orchard::Action<SpendAuth>> for compact_formats::CompactOr
             nullifier: action.nullifier().to_bytes().to_vec(),
             cmx: action.cmx().to_bytes().to_vec(),
             ephemeral_key: action.encrypted_note().epk_bytes.to_vec(),
-            ciphertext: action.encrypted_note().enc_ciphertext[..COMPACT_NOTE_SIZE].to_vec(),
+            ciphertext: action.encrypted_note().enc_ciphertext.as_ref()
+                [..orchard::note_encryption::COMPACT_NOTE_SIZE]
+                .to_vec(),
         }
     }
 }
@@ -361,7 +404,8 @@ impl service::LightdInfo {
         if self.donation_address.is_empty() {
             None
         } else {
-            let (network_type, address) = unified::Address::decode(&self.donation_address).ok()?;
+            let (network_type, _revision, address) =
+                unified::Address::decode(&self.donation_address).ok()?;
             (Some(network_type) == self.chain_name()).then_some(address)
         }
     }
@@ -472,6 +516,7 @@ pub const PROPOSAL_SER_V1: u32 = 1;
 /// Errors that can occur in the process of decoding a [`Proposal`] from its protobuf
 /// representation.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ProposalDecodingError<DbError> {
     /// The encoded proposal contained no steps.
     NoSteps,
@@ -660,8 +705,6 @@ impl proposal::Proposal {
     /// Serializes a [`Proposal`] based upon a supported [`StandardFeeRule`] to its protobuf
     /// representation.
     pub fn from_standard_proposal<NoteRef>(value: &Proposal<StandardFeeRule, NoteRef>) -> Self {
-        use proposal::proposed_input;
-        use proposal::{PriorStepChange, PriorStepOutput, ReceivedOutput};
         let steps = value
             .steps()
             .iter()
@@ -749,6 +792,28 @@ impl proposal::Proposal {
                         })
                         .collect(),
                     fee_required: step.balance().fee_required().into(),
+                    dummy_outputs: step.balance().dummy_outputs().map(|counts| {
+                        proposal::DummyOutputs {
+                            sapling: counts
+                                .sapling()
+                                .try_into()
+                                .expect("Sapling dummy-output count fits into u32"),
+                            #[cfg(feature = "orchard")]
+                            orchard: counts
+                                .orchard()
+                                .try_into()
+                                .expect("Orchard dummy-output count fits into u32"),
+                            #[cfg(not(feature = "orchard"))]
+                            orchard: 0,
+                            #[cfg(feature = "orchard")]
+                            ironwood: counts
+                                .ironwood()
+                                .try_into()
+                                .expect("Ironwood dummy-output count fits into u32"),
+                            #[cfg(not(feature = "orchard"))]
+                            ironwood: 0,
+                        }
+                    }),
                 });
 
                 proposal::ProposalStep {
@@ -794,7 +859,6 @@ impl proposal::Proposal {
         ParamsT: consensus::Parameters,
         DbT: InputSource<Error = DbError>,
     {
-        use self::proposal::proposed_input::Value::*;
         match self.proto_version {
             PROPOSAL_SER_V1 => {
                 let fee_rule = match self.fee_rule() {
@@ -1011,6 +1075,21 @@ impl proposal::Proposal {
                             .map_err(|_| ProposalDecodingError::BalanceInvalid)?,
                     )
                     .map_err(|_| ProposalDecodingError::BalanceInvalid)?;
+                    let balance = match proto_balance.dummy_outputs.as_ref() {
+                        Some(counts) => {
+                            #[cfg(feature = "orchard")]
+                            let dummy_outputs = DummyOutputCounts::new(
+                                counts.sapling as usize,
+                                counts.orchard as usize,
+                                counts.ironwood as usize,
+                            );
+                            #[cfg(not(feature = "orchard"))]
+                            let dummy_outputs = DummyOutputCounts::new(counts.sapling as usize);
+                            balance.with_dummy_outputs(dummy_outputs)
+                        }
+                        // Older proposals did not explicitly model their dummy outputs.
+                        None => balance,
+                    };
 
                     // The `anchorHeight` field's zero value is the wire sentinel for a step that
                     // carries no anchor. Only a purely transparent step may lack one: any step that

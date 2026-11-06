@@ -18,7 +18,15 @@ use zcash_protocol::{
     consensus::{self, BlockHeight, NetworkUpgrade, TxIndex},
 };
 
-use super::{Nullifiers, PositionTracker, ScanError, ScanningKeys, find_received, find_spent};
+use super::{
+    PositionTracker, ScanError, ScanningKeys, SpendIdentifiers, find_received, find_spent,
+};
+
+#[cfg(feature = "transparent-inputs")]
+use super::find_transparent_spends;
+
+#[doc(inline)]
+pub use super::ScanBlockError;
 use crate::{
     data_api::{
         BlockMetadata, ScannedBlock, ScannedBundles, ll::wallet::detect_wallet_transparent_outputs,
@@ -29,6 +37,9 @@ use crate::{
 
 #[cfg(feature = "orchard")]
 use orchard::{note_encryption::OrchardDomain, primitives::redpallas, tree::MerkleHashOrchard};
+
+#[cfg(all(feature = "orchard", feature = "zsa"))]
+use orchard::zsa::OrchardZSADomain;
 
 #[cfg(feature = "orchard")]
 use super::IronwoodDomain;
@@ -72,6 +83,22 @@ type TaggedOrchardBatchRunner<IvkTag, Tasks> = BatchRunner<
     Tasks,
 >;
 
+#[cfg(all(feature = "orchard", feature = "zsa"))]
+type TaggedZsaBatch<IvkTag> = Batch<
+    IvkTag,
+    OrchardZSADomain,
+    orchard::Action<redpallas::Signature<redpallas::SpendAuth>, OrchardZSADomain>,
+    FullDecryptor,
+>;
+#[cfg(all(feature = "orchard", feature = "zsa"))]
+type TaggedZsaBatchRunner<IvkTag, Tasks> = BatchRunner<
+    IvkTag,
+    OrchardZSADomain,
+    orchard::Action<redpallas::Signature<redpallas::SpendAuth>, OrchardZSADomain>,
+    FullDecryptor,
+    Tasks,
+>;
+
 // Ironwood outputs are decrypted under the Ironwood note-encryption domain, which is distinct from
 // the Orchard domain (it accepts version 3 note plaintexts), so an Ironwood batch is a distinct
 // type from an Orchard batch and requires its own task type.
@@ -99,10 +126,21 @@ pub(crate) trait OrchardTasks<IvkTag> {}
 #[cfg(not(feature = "orchard"))]
 impl<IvkTag, T> OrchardTasks<IvkTag> for T {}
 
-#[cfg(feature = "orchard")]
+#[cfg(all(feature = "orchard", not(feature = "zsa")))]
 pub(crate) trait OrchardTasks<IvkTag>: Tasks<TaggedOrchardBatch<IvkTag>> {}
-#[cfg(feature = "orchard")]
+#[cfg(all(feature = "orchard", not(feature = "zsa")))]
 impl<IvkTag, T: Tasks<TaggedOrchardBatch<IvkTag>>> OrchardTasks<IvkTag> for T {}
+
+#[cfg(all(feature = "orchard", feature = "zsa"))]
+pub(crate) trait OrchardTasks<IvkTag>:
+    Tasks<TaggedOrchardBatch<IvkTag>> + Tasks<TaggedZsaBatch<IvkTag>>
+{
+}
+#[cfg(all(feature = "orchard", feature = "zsa"))]
+impl<IvkTag, T> OrchardTasks<IvkTag> for T where
+    T: Tasks<TaggedOrchardBatch<IvkTag>> + Tasks<TaggedZsaBatch<IvkTag>>
+{
+}
 
 #[cfg(not(feature = "orchard"))]
 pub(crate) trait IronwoodTasks<IvkTag> {}
@@ -123,6 +161,8 @@ pub(crate) struct BatchRunners<
     sapling: TaggedSaplingBatchRunner<IvkTag, TS>,
     #[cfg(feature = "orchard")]
     orchard: TaggedOrchardBatchRunner<IvkTag, TO>,
+    #[cfg(all(feature = "orchard", feature = "zsa"))]
+    orchard_zsa: TaggedZsaBatchRunner<IvkTag, TO>,
     #[cfg(feature = "orchard")]
     ironwood: TaggedIronwoodBatchRunner<IvkTag, TI>,
     #[cfg(not(feature = "orchard"))]
@@ -157,6 +197,14 @@ where
             ),
             #[cfg(feature = "orchard")]
             orchard: BatchRunner::new(
+                orchard_batch_size_threshold,
+                scanning_keys
+                    .orchard()
+                    .iter()
+                    .map(|(id, key)| (id.clone(), key.prepare())),
+            ),
+            #[cfg(all(feature = "orchard", feature = "zsa"))]
+            orchard_zsa: BatchRunner::new(
                 orchard_batch_size_threshold,
                 scanning_keys
                     .orchard()
@@ -206,10 +254,24 @@ where
         });
 
         #[cfg(feature = "orchard")]
-        let orchard_batch = tx.orchard_bundle().map(|bundle| {
-            self.orchard
-                .process_outputs(OrchardDomain::for_action, bundle.actions().iter().cloned())
-        });
+        let orchard_batch = tx
+            .orchard_bundle()
+            .and_then(|bundle| bundle.as_vanilla())
+            .map(|bundle| {
+                self.orchard
+                    .process_outputs(OrchardDomain::for_action, bundle.actions().iter().cloned())
+            });
+
+        #[cfg(all(feature = "orchard", feature = "zsa"))]
+        let orchard_zsa_batch =
+            tx.orchard_bundle()
+                .and_then(|bundle| bundle.as_zsa())
+                .map(|bundle| {
+                    self.orchard_zsa.process_outputs(
+                        OrchardZSADomain::for_action,
+                        bundle.actions().iter().cloned(),
+                    )
+                });
 
         #[cfg(feature = "orchard")]
         let ironwood_batch = tx.ironwood_bundle().map(|bundle| {
@@ -222,6 +284,8 @@ where
             sapling_batch,
             #[cfg(feature = "orchard")]
             orchard_batch,
+            #[cfg(all(feature = "orchard", feature = "zsa"))]
+            orchard_zsa_batch,
             #[cfg(feature = "orchard")]
             ironwood_batch,
         }
@@ -234,6 +298,8 @@ where
         self.sapling.flush();
         #[cfg(feature = "orchard")]
         self.orchard.flush();
+        #[cfg(all(feature = "orchard", feature = "zsa"))]
+        self.orchard_zsa.flush();
         #[cfg(feature = "orchard")]
         self.ironwood.flush();
     }
@@ -245,6 +311,9 @@ pub(crate) struct PendingBatch<IvkTag> {
     sapling_batch: Option<BatchReceiver<IvkTag, SaplingDomain, <SaplingDomain as Domain>::Memo>>,
     #[cfg(feature = "orchard")]
     orchard_batch: Option<BatchReceiver<IvkTag, OrchardDomain, <OrchardDomain as Domain>::Memo>>,
+    #[cfg(all(feature = "orchard", feature = "zsa"))]
+    orchard_zsa_batch:
+        Option<BatchReceiver<IvkTag, OrchardZSADomain, <OrchardZSADomain as Domain>::Memo>>,
     #[cfg(feature = "orchard")]
     ironwood_batch: Option<BatchReceiver<IvkTag, IronwoodDomain, <IronwoodDomain as Domain>::Memo>>,
 }
@@ -261,6 +330,11 @@ impl<IvkTag> PendingBatch<IvkTag> {
             #[cfg(feature = "orchard")]
             orchard: self
                 .orchard_batch
+                .map(|b| b.into_results())
+                .unwrap_or_default(),
+            #[cfg(all(feature = "orchard", feature = "zsa"))]
+            orchard_zsa: self
+                .orchard_zsa_batch
                 .map(|b| b.into_results())
                 .unwrap_or_default(),
             #[cfg(feature = "orchard")]
@@ -286,6 +360,11 @@ impl<IvkTag> PendingBatch<IvkTag> {
             Some(b) => b.into_results_async().await,
             None => HashMap::new(),
         };
+        #[cfg(all(feature = "orchard", feature = "zsa"))]
+        let orchard_zsa = match self.orchard_zsa_batch {
+            Some(b) => b.into_results_async().await,
+            None => HashMap::new(),
+        };
         #[cfg(feature = "orchard")]
         let ironwood = match self.ironwood_batch {
             Some(b) => b.into_results_async().await,
@@ -296,6 +375,8 @@ impl<IvkTag> PendingBatch<IvkTag> {
             sapling,
             #[cfg(feature = "orchard")]
             orchard,
+            #[cfg(all(feature = "orchard", feature = "zsa"))]
+            orchard_zsa,
             #[cfg(feature = "orchard")]
             ironwood,
         }
@@ -313,6 +394,11 @@ pub struct BatchResult<IvkTag> {
     #[cfg(feature = "orchard")]
     orchard:
         HashMap<usize, DecryptedOutput<IvkTag, OrchardDomain, <OrchardDomain as Domain>::Memo>>,
+    #[cfg(all(feature = "orchard", feature = "zsa"))]
+    orchard_zsa: HashMap<
+        usize,
+        DecryptedOutput<IvkTag, OrchardZSADomain, <OrchardZSADomain as Domain>::Memo>,
+    >,
     #[cfg(feature = "orchard")]
     ironwood:
         HashMap<usize, DecryptedOutput<IvkTag, IronwoodDomain, <IronwoodDomain as Domain>::Memo>>,
@@ -364,44 +450,6 @@ where
     (header, vtx)
 }
 
-/// Errors that can occur while scanning a full block via [`scan_block`].
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum ScanBlockError<E> {
-    /// A structural or continuity error in the block being scanned.
-    Scan(ScanError),
-    /// An error occurred while looking up the wallet account associated with a
-    /// transparent address.
-    AddressLookup(E),
-}
-
-impl<E> From<ScanError> for ScanBlockError<E> {
-    fn from(e: ScanError) -> Self {
-        ScanBlockError::Scan(e)
-    }
-}
-
-impl<E: fmt::Display> fmt::Display for ScanBlockError<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ScanBlockError::Scan(e) => write!(f, "Error scanning block: {e}"),
-            ScanBlockError::AddressLookup(e) => write!(
-                f,
-                "Error looking up the wallet account for a transparent address: {e}"
-            ),
-        }
-    }
-}
-
-impl<E: std::error::Error + 'static> std::error::Error for ScanBlockError<E> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            ScanBlockError::Scan(e) => Some(e),
-            ScanBlockError::AddressLookup(e) => Some(e),
-        }
-    }
-}
-
 /// Scans a block with a set of [`ScanningKeys`].
 ///
 /// Returns a [`ScannedBlock`] containing one [`WalletTx`] for each transaction in the
@@ -428,7 +476,7 @@ pub fn scan_block<P, AccountId, IvkTag, E>(
     header: &BlockHeader,
     vtx: Vec<BatchResult<IvkTag>>,
     scanning_keys: &ScanningKeys<AccountId, IvkTag>,
-    nullifiers: &Nullifiers<AccountId>,
+    spend_ids: &SpendIdentifiers<AccountId>,
     prior_block_metadata: Option<&BlockMetadata>,
     #[cfg(feature = "transparent-inputs")] find_account_for_address: impl Fn(
         &TransparentAddress,
@@ -495,12 +543,17 @@ where
     #[cfg(feature = "orchard")]
     let mut ironwood_note_commitments: Vec<(MerkleHashOrchard, Retention<BlockHeight>)> = vec![];
 
+    #[cfg(feature = "transparent-inputs")]
+    let mut transparent_spend_map = Vec::with_capacity(vtx.len());
+
     for (tx_index, batch) in vtx.into_iter().enumerate() {
         let BatchResult {
             tx,
             sapling: sapling_decrypted,
             #[cfg(feature = "orchard")]
                 orchard: orchard_decrypted,
+            #[cfg(all(feature = "orchard", feature = "zsa"))]
+                orchard_zsa: orchard_zsa_decrypted,
             #[cfg(feature = "orchard")]
                 ironwood: ironwood_decrypted,
         } = batch;
@@ -513,7 +566,7 @@ where
             .map(|bundle| {
                 find_spent(
                     bundle.shielded_spends(),
-                    &nullifiers.sapling,
+                    spend_ids.shielded().sapling(),
                     |spend| *spend.nullifier(),
                     WalletSpend::from_parts,
                 )
@@ -528,9 +581,9 @@ where
                 .orchard_bundle()
                 .map(|bundle| {
                     find_spent(
-                        bundle.actions().iter(),
-                        &nullifiers.orchard,
-                        |action| *action.nullifier(),
+                        bundle.nullifiers(),
+                        spend_ids.shielded().orchard(),
+                        |nullifier| *nullifier,
                         WalletSpend::from_parts,
                     )
                 })
@@ -546,7 +599,7 @@ where
                 .map(|bundle| {
                     find_spent(
                         bundle.actions().iter(),
-                        &nullifiers.ironwood,
+                        spend_ids.shielded().ironwood(),
                         |action| *action.nullifier(),
                         WalletSpend::from_parts,
                     )
@@ -556,8 +609,30 @@ where
             ironwood_spends
         };
 
+        // Detect spends of transparent outputs the wallet is tracking. A coinbase transaction's
+        // single input spends the null outpoint rather than a real prior output, so it is
+        // excluded: it can match no wallet output, and recording it would collide with the
+        // corresponding input of every other block's coinbase.
+        #[cfg(feature = "transparent-inputs")]
+        let (transparent_spends, unlinked_prevouts) = tx
+            .transparent_bundle()
+            .filter(|bundle| !bundle.is_coinbase())
+            .map(|bundle| {
+                find_transparent_spends(
+                    bundle.vin.iter().map(|txin| txin.prevout().clone()),
+                    spend_ids.transparent(),
+                )
+            })
+            .unwrap_or_default();
+
+        #[cfg(feature = "transparent-inputs")]
+        transparent_spend_map.push((tx_index, txid, unlinked_prevouts));
+
         // Collect the set of accounts that were spent from in this transaction
         let spent_from_accounts = sapling_spends.iter().map(|spend| spend.account_id());
+        #[cfg(feature = "transparent-inputs")]
+        let spent_from_accounts =
+            spent_from_accounts.chain(transparent_spends.iter().map(|spend| spend.account_id()));
         #[cfg(feature = "orchard")]
         let spent_from_accounts =
             spent_from_accounts.chain(orchard_spends.iter().map(|spend| spend.account_id()));
@@ -579,9 +654,6 @@ where
             )
         }
 
-        // TODO: Transparent spend detection for full blocks is not yet implemented; only
-        // received transparent outputs are scanned here.
-        // https://github.com/zcash/librustzcash/issues/2395
         let transparent_outputs = detect_wallet_transparent_outputs(
             params,
             &tx,
@@ -591,6 +663,10 @@ where
             &find_account_for_address,
         )
         .map_err(ScanBlockError::AddressLookup)?;
+
+        #[cfg(feature = "transparent-inputs")]
+        let has_transparent = !(transparent_spends.is_empty() && transparent_outputs.is_empty());
+        #[cfg(not(feature = "transparent-inputs"))]
         let has_transparent = !transparent_outputs.is_empty();
 
         let (sapling_outputs, mut sapling_nc) = tx
@@ -621,6 +697,7 @@ where
         #[cfg(feature = "orchard")]
         let (orchard_outputs, mut orchard_nc) = tx
             .orchard_bundle()
+            .and_then(|bundle| bundle.as_vanilla())
             .map(|bundle| {
                 find_received(
                     height,
@@ -641,6 +718,32 @@ where
                 )
             })
             .unwrap_or_default();
+
+        #[cfg(all(feature = "orchard", feature = "zsa"))]
+        let mut orchard_outputs = orchard_outputs;
+
+        #[cfg(all(feature = "orchard", feature = "zsa"))]
+        if let Some(bundle) = tx.orchard_bundle().and_then(|bundle| bundle.as_zsa()) {
+            let (mut zsa_outputs, mut zsa_nc) = find_received(
+                height,
+                pos_tracker.tx_contains_last_orchard_actions_in_block(&tx),
+                txid,
+                |output_idx| pos_tracker.orchard_note_position(output_idx),
+                &scanning_keys.orchard,
+                &spent_from_accounts,
+                &bundle
+                    .actions()
+                    .iter()
+                    .map(|action| (OrchardZSADomain::for_action(action), action.clone()))
+                    .collect::<Vec<_>>(),
+                Some(move |_| orchard_zsa_decrypted),
+                batch::try_note_decryption,
+                |action| MerkleHashOrchard::from_cmx(action.cmx()),
+                |note| (note, orchard::ValuePool::Orchard),
+            );
+            orchard_outputs.append(&mut zsa_outputs);
+            orchard_nc.append(&mut zsa_nc);
+        }
         #[cfg(feature = "orchard")]
         orchard_note_commitments.append(&mut orchard_nc);
 
@@ -684,6 +787,10 @@ where
             wtxs.push(WalletTx::new(
                 txid,
                 tx_index,
+                #[cfg(feature = "transparent-inputs")]
+                transparent_spends,
+                #[cfg(not(feature = "transparent-inputs"))]
+                vec![],
                 transparent_outputs,
                 sapling_spends,
                 sapling_outputs,
@@ -725,6 +832,8 @@ where
             ironwood_note_commitments,
             ironwood_nullifier_map,
         ),
+        #[cfg(feature = "transparent-inputs")]
+        transparent_spend_map,
     ))
 }
 
@@ -796,7 +905,7 @@ fn sapling_output_count(tx: &Transaction) -> u32 {
 #[cfg(feature = "orchard")]
 fn orchard_action_count(tx: &Transaction) -> u32 {
     tx.orchard_bundle().map_or(0, |b| {
-        u32::try_from(b.actions().len()).expect("Orchard action count cannot exceed a u32")
+        u32::try_from(b.action_count()).expect("Orchard action count cannot exceed a u32")
     })
 }
 
@@ -838,7 +947,7 @@ impl PositionTracker {
             params.activation_height(NetworkUpgrade::Nu5),
             prior_block_metadata.and_then(|m| m.orchard_tree_size()),
             vtx.iter()
-                .map(|b| b.tx.orchard_bundle().map_or(0, |bd| bd.actions().len())),
+                .map(|b| b.tx.orchard_bundle().map_or(0, |bd| bd.action_count())),
             ShieldedPool::Orchard,
         )?;
 

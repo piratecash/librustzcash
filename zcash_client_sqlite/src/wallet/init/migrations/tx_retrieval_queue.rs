@@ -5,7 +5,6 @@ use schemerz_rusqlite::RusqliteMigration;
 use std::collections::HashSet;
 use uuid::Uuid;
 
-use zcash_primitives::transaction::builder::DEFAULT_TX_EXPIRY_DELTA;
 use zcash_protocol::consensus;
 
 use crate::wallet::init::WalletMigrationError;
@@ -15,7 +14,9 @@ use super::{
     spend_key_available,
 };
 
-pub(super) const MIGRATION_ID: Uuid = Uuid::from_u128(0xfec02b61_3988_4b4f_9699_98977fac9e7f);
+/// Adds tables for tracking transactions to be downloaded for transparent output and/or memo
+/// retrieval.
+pub const MIGRATION_ID: Uuid = Uuid::from_u128(0xfec02b61_3988_4b4f_9699_98977fac9e7f);
 
 #[cfg(feature = "transparent-inputs")]
 use {
@@ -36,13 +37,17 @@ use {
     },
 };
 
-const DEPENDENCIES: &[Uuid] = &[
+pub(super) const DEPENDENCIES: &[Uuid] = &[
     orchard_shardtree::MIGRATION_ID,
     ensure_orchard_ua_receiver::MIGRATION_ID,
     ephemeral_addresses::MIGRATION_ID,
     spend_key_available::MIGRATION_ID,
     nullifier_map::MIGRATION_ID,
 ];
+
+/// The default transaction expiry delta, in blocks, that the wallet used when this migration was
+/// written. It is pinned so that the migration's effect does not change with later defaults.
+const PRE_NU7_DEFAULT_TX_EXPIRY_DELTA: u32 = 40;
 
 pub(super) struct Migration<P> {
     pub(super) _params: P,
@@ -106,7 +111,7 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
              SET target_height = expiry_height - :default_expiry_delta
              WHERE expiry_height > :default_expiry_delta
              AND created IS NOT NULL",
-            named_params![":default_expiry_delta": DEFAULT_TX_EXPIRY_DELTA],
+            named_params![":default_expiry_delta": PRE_NU7_DEFAULT_TX_EXPIRY_DELTA],
         )?;
 
         // Populate the enhancement queues with any transparent history information that we don't
@@ -323,6 +328,9 @@ fn queue_tx_retrieval(
 }
 
 #[cfg(test)]
+mod released_expiry_delta_tests;
+
+#[cfg(test)]
 mod tests {
     use rusqlite::named_params;
     use secrecy::Secret;
@@ -390,7 +398,7 @@ mod tests {
             BranchId::Nu5,
             0,
             12345678.into(),
-            #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
+            #[cfg(feature = "zip-233")]
             Zatoshis::ZERO,
             Some(transparent::bundle::Bundle {
                 vin: vec![TxIn::from_parts(OutPoint::fake(), Script::default(), 0)],

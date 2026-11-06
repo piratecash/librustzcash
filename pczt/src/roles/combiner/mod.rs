@@ -59,6 +59,7 @@ fn merge(lhs: Pczt, rhs: Pczt) -> Result<Pczt, Error> {
         sapling,
         orchard,
         ironwood,
+        issue: lhs.issue.clone(),
     })
 }
 
